@@ -128,104 +128,38 @@ export async function analyzeImage(buffer, options = {}) {
 
     let data = new Uint8Array(rawBlue);
 
-    // Allow rawBlue to be equal or larger than width*height (some images may include extra padding);
-    // if larger, truncate to the expected pixel count so downstream code works reliably.
-    const expectedLen = width * height;
-    if (!data || data.length < expectedLen) {
-      throw new Error(`Unexpected raw channel length (${data ? data.length : 0}) for image ${width}x${height}`);
-    }
-    if (data.length > expectedLen) {
-      data = data.slice(0, expectedLen);
-    }
     // 1.1 Detect 93mm circle / annulus for pixel scale
     let medianInitial = calculateMedian(data);
-    // First run the box-based detector to get a reliable center candidate.
-    const boxCircle = detectReferenceCircle(data, width, height, medianInitial);
+
     let circleInfo = null;
-    let detectorUsed = null; // 'gradient' | 'radial' | 'avg' | 'box' | 'hough' | null
-    let usedDetectorDetail = null; // e.g. 'hough:python', 'hough:opencv4nodejs', 'radial'
+    let detectorUsed = null;
+    let usedDetectorDetail = null;
     let fallbackUsed = false;
 
-    // Try Hough-circle detection first (node-native OpenCV or Python helper)
-    let hough = null;
-    try {
-      const houghOptions = {
-        dp: options.houghDp || options.dp,
-        param1: options.houghParam1 || options.param1,
-        param2: options.houghParam2 || options.param2,
-        downsample: options.houghDownsample || options.downsample,
-        minRadius: options.houghMinRadius || options.minRadius,
-        maxRadius: options.houghMaxRadius || options.maxRadius,
-      };
-      hough = await runHoughDetect(buffer, houghOptions);
-      if (hough && hough.center) {
-         // Sanity-check the hough detection before accepting it: center must be inside image bounds
-         // and diameter should be within a reasonable factor of the image size.
-         const imgW = width;
-         const imgH = height;
-         const imgMax = Math.max(imgW, imgH);
-         const imgMin = Math.min(imgW, imgH);
-        const diam = Number(hough.diameterPixels) || null;
-        const cx = Number(hough.center.x) || 0;
-        const cy = Number(hough.center.y) || 0;
-        const plausibleCenter = cx >= 0 && cx <= imgW && cy >= 0 && cy <= imgH;
-        const plausibleSize = diam !== null ? (diam > 10 && diam <= imgMax * 1.25) : false; // allow some tolerance
+    // Use box detector first to get candidate center
+    const boxCircle = detectReferenceCircle(data, width, height, medianInitial);
+    const initialCenter = boxCircle ? boxCircle.center : { x: width / 2, y: height / 2 };
 
-        // If Hough provides a center, prefer to use the Hough center. If diameter is implausible
-        // or missing, compute robust radii via radial-average sampling around the Hough center.
-        if (!plausibleCenter) {
-          try { logger.warn({ houghRaw: hough.raw || null, houghStderr: hough.stderr || null, houghInputFile: hough.inputFile || null, cx, cy, diam, imgW, imgH }, 'Rejected Hough center (outside image)'); } catch (e) {}
-        } else {
-          // Try to use hough diameter if plausible
-          if (plausibleSize) {
-            circleInfo = {
-              diameterPixels: diam,
-              innerDiameterPixels: hough.innerDiameterPixels || null,
-              center: hough.center,
-              region: { xMin: Math.round(cx - diam / 2), xMax: Math.round(cx + diam / 2), yMin: Math.round(cy - diam / 2), yMax: Math.round(cy + diam / 2) }
-            };
-          } else {
-            // Use radial-average fallback centered at Hough center to compute radii robustly
-            try {
-              const avg = detectAnnulusByRadialProfileAvg(data, width, height, medianInitial, { x: cx, y: cy }, { expectedOuterDiameterPx, minDetectedOuterFraction, minOuterImgFraction });
-              if (avg && avg.diameterPixels > 0) {
-                circleInfo = avg;
-                fallbackUsed = true; // we used radial-average but Hough provided center
-                if (debug) try { logger.info({ houghRaw: hough.raw || null, houghInputFile: hough.inputFile || null, usedAvgFromHoughCenter: true }, 'Hough center used with radial-average to compute radii'); } catch (e) {}
-              }
-            } catch (e) {
-              // ignore and allow other fallbacks to run
-            }
-          }
+    // Primary Pure JS Detector: Iterative Radial Gradient
+    circleInfo = detectAnnulusIterative(data, width, height, medianInitial, initialCenter, {
+      expectedOuterDiameterPx,
+      minDetectedOuterFraction,
+      minOuterImgFraction
+    });
 
-          // Mark detector as hough (we used the Hough center even if radii came from radial-average)
-          detectorUsed = 'hough';
-          usedDetectorDetail = (hough.source || 'hough') + (hough.helper ? ` (${hough.helper})` : '');
-          if (debug) {
-            try { logger.info({ houghRaw: hough.raw || null, houghStderr: hough.stderr || null, houghInputFile: hough.inputFile || null }, 'Hough helper output'); } catch (e) {}
-          }
-        }
-      }
-    } catch (e) {
-      // if Hough fails for any reason, continue to other detectors
+    if (circleInfo) {
+      detectorUsed = 'js_radial';
+      usedDetectorDetail = 'iterative radial gradient (JS)';
     }
 
-    // If gradient didn't find anything, try radial-profile detector.
-    // Prefer using the Hough center if available so Hough is considered the detector
-    // even when radii are computed by radial sampling.
+    // If detectAnnulusIterative failed, try remaining fallbacks.
     if (!circleInfo) {
-      const preferCenter = (hough && hough.center) ? hough.center : (boxCircle ? boxCircle.center : null);
+      const preferCenter = boxCircle ? boxCircle.center : null;
       const radial = detectAnnulusByRadialProfile(data, width, height, medianInitial, preferCenter, { expectedOuterDiameterPx, minDetectedOuterFraction, minOuterImgFraction });
       if (radial) {
         circleInfo = radial;
-        if (typeof hough !== 'undefined' && hough && hough.center) {
-          // Hough provided the center; preserve 'hough' as the detector
-          detectorUsed = detectorUsed || 'hough';
-          usedDetectorDetail = usedDetectorDetail || 'hough';
-        } else {
-          detectorUsed = 'radial';
-          usedDetectorDetail = 'radial';
-        }
+        detectorUsed = 'radial';
+        usedDetectorDetail = 'radial';
       }
     }
 
@@ -1021,102 +955,6 @@ function calculateMedian(data, region = null, width = 0) {
   return 128;
 }
 
-async function runHoughDetect(buffer, options = {}) {
-  // Try multiple Hough parameter sets (Python helper preferred) and accept the
-  // first plausible detection. This avoids a single fragile parameter choice.
-  const candidates = [
-    { downsample: options.downsample || 1600, dp: options.dp || 1.0, param1: options.param1 || 80, param2: options.param2 || 18 },
-    { downsample: options.downsample || 1200, dp: 1.2, param1: 100, param2: 30 },
-    { downsample: options.downsample || 1200, dp: 1.0, param1: 120, param2: 40 }
-  ];
-
-  const tmpDir = os.tmpdir();
-  for (const cand of candidates) {
-      const tmpFile = path.join(tmpDir, `hough_input_${Date.now()}.jpg`);
-      try {
-        try {
-          fs.writeFileSync(tmpFile, buffer);
-          const py = path.join(serverDir, 'util', 'hough_detect.py');
-          const args = [py, '--input', tmpFile, '--downsample', String(cand.downsample), '--param1', String(cand.param1), '--param2', String(cand.param2), '--dp', String(cand.dp)];
-          const pyRes = await new Promise((resolve) => {
-            const p = spawn('python3', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-            let out = '';
-            let errOut = '';
-            p.stdout.on('data', (chunk) => { out += chunk.toString(); });
-            p.stderr.on('data', (chunk) => { errOut += chunk.toString(); });
-            p.on('close', () => {
-              resolve({ out, errOut });
-            });
-          });
-
-          const { out, errOut } = pyRes;
-           if (errOut) {
-             logger.warn({ err: errOut.trim() }, 'Hough detection warning');
-           }
-
-          // Try parsing helper output as JSON first (our helper prints JSON), but be resilient
-          // to helper debug text before/after the JSON block. Extract first {...} substring.
-          if (out && out.trim().length > 0) {
-            // try to locate a JSON object in the output
-            let parsed = null;
-            const firstBrace = out.indexOf('{');
-            const lastBrace = out.lastIndexOf('}');
-            if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-              const jsonText = out.substring(firstBrace, lastBrace + 1);
-              try {
-                const j = JSON.parse(jsonText);
-                parsed = j;
-              } catch (e) {
-                // JSON parse failed; fall through to line parsing
-              }
-            }
-            if (!parsed) {
-              // fallback: try to parse any numeric key=value lines
-              try {
-                const h = parseHoughOutput(out);
-                if (h && h.center) return h;
-              } catch (e2) {
-                logger.warn({ parseErr: e2 && e2.message, out }, 'Failed to parse non-JSON hough output');
-              }
-            } else {
-              const j = parsed;
-              if (j && (j.found || (j.cx !== undefined && j.outerRadius !== undefined))) {
-                return { center: { x: j.cx, y: j.cy }, diameterPixels: j.outerRadius * 2, innerDiameterPixels: j.innerRadius ? j.innerRadius * 2 : null, source: 'hough', helper: 'python', raw: j, stderr: errOut, inputFile: tmpFile };
-              }
-            }
-          }
-         } finally {
-          try { fs.unlinkSync(tmpFile); } catch (e) {}
-        }
-      } catch (e) {
-        logger.error({ err: e.message, stack: e.stack }, 'Hough detection error');
-      }
-    }
-
-    // No candidate produced a usable Hough result: return null so caller falls back
-    return null;
-  }
-
-  function parseHoughOutput(out) {
-    const lines = out.trim().split('\n');
-    const result = {};
-    for (const line of lines) {
-      const m = line.match(/([a-zA-Z0-9_]+)\s*[:=]\s*([0-9\.\-]+)/);
-      if (m) {
-        result[m[1]] = Number(m[2]);
-      }
-    }
-    const diameterPixels = result.diameterPixels || result.outerRadius || null;
-    const center_x = result.cx || result.center_x || null;
-    const center_y = result.cy || result.center_y || null;
-    const inner_diameter_pixels = result.innerRadius || result.inner_diameter_pixels || null;
-    return {
-      diameterPixels: diameterPixels || null,
-      center: { x: center_x || null, y: center_y || null },
-      innerDiameterPixels: inner_diameter_pixels || null,
-      raw: out,
-    };
-  }
 
 function breakClump(cluster, seedIndex, data, width, height, median, opts = {}) {
   // Conservative, dependency-free clump breaker:
@@ -1250,4 +1088,131 @@ function breakClump(cluster, seedIndex, data, width, height, median, opts = {}) 
     return cluster;
   }
   return out;
+}
+
+function detectAnnulusIterative(data, width, height, median, initialCenter, opts = {}) {
+  // Pure JS iterative radial detector for identifying the annulus.
+  // 1. Samples rays from center to find edge points via gradient.
+  // 2. Fits a circle to those points to refine center and radius.
+  // 3. Repeats to converge.
+
+  const { expectedOuterDiameterPx = 1744, minDetectedOuterFraction = 0.6 } = opts;
+  const expectedRadius = expectedOuterDiameterPx / 2;
+  const minRadius = expectedRadius * minDetectedOuterFraction;
+  const circleThreshold = (median * 40) / 100;
+
+  let currentCenter = { ...initialCenter };
+  let outerRadius = expectedRadius;
+  let innerRadius = expectedRadius * 0.9;
+
+  const maxIterations = 3;
+  for (let iter = 0; iter < maxIterations; iter++) {
+    const rays = 72; // every 5 degrees
+    const outerPoints = [];
+    const innerPoints = [];
+
+    for (let i = 0; i < rays; i++) {
+      const theta = (i * 5 * Math.PI) / 180;
+      const cos = Math.cos(theta);
+      const sin = Math.sin(theta);
+
+      // Search for outer edge (strong negative gradient)
+      // Search range: [expectedRadius * 0.5, expectedRadius * 1.5]
+      let bestGrad = 0;
+      let bestR = null;
+      const searchStart = Math.max(10, Math.round(outerRadius * 0.7));
+      const searchEnd = Math.min(Math.min(width, height) / 2, Math.round(outerRadius * 1.3));
+
+      for (let r = searchStart; r < searchEnd; r++) {
+        const x = Math.round(currentCenter.x + r * cos);
+        const y = Math.round(currentCenter.y + r * sin);
+        if (x < 1 || x >= width - 1 || y < 1 || y >= height - 1) break;
+
+        const idx = y * width + x;
+        // Radial gradient approximated by central difference along ray
+        // (Next - Prev) along the direction of the ray
+        const rNext = Math.round(currentCenter.x + (r+1) * cos) + Math.round(currentCenter.y + (r+1) * sin) * width;
+        const rPrev = Math.round(currentCenter.x + (r-1) * cos) + Math.round(currentCenter.y + (r-1) * sin) * width;
+        const grad = data[rNext] - data[rPrev];
+
+        if (grad < bestGrad) {
+          bestGrad = grad;
+          bestR = r;
+        }
+      }
+
+      if (bestR && bestGrad < -5) { // Threshold for "sharp enough" edge
+        outerPoints.push({ x: currentCenter.x + bestR * cos, y: currentCenter.y + bestR * sin, r: bestR });
+      }
+
+      // Search for inner edge (strong positive gradient inside outer edge)
+      if (bestR) {
+        let bestInnerGrad = 0;
+        let bestInnerR = null;
+        for (let r = Math.round(bestR * 0.5); r < bestR; r++) {
+          const x = Math.round(currentCenter.x + r * cos);
+          const y = Math.round(currentCenter.y + r * sin);
+          if (x < 1 || x >= width - 1 || y < 1 || y >= height - 1) break;
+          const rNext = Math.round(currentCenter.x + (r+1) * cos) + Math.round(currentCenter.y + (r+1) * sin) * width;
+          const rPrev = Math.round(currentCenter.x + (r-1) * cos) + Math.round(currentCenter.y + (r-1) * sin) * width;
+          const grad = data[rNext] - data[rPrev];
+          if (grad > bestInnerGrad) {
+            bestInnerGrad = grad;
+            bestInnerR = r;
+          }
+        }
+        if (bestInnerR) innerPoints.push({ r: bestInnerR });
+      }
+    }
+
+    if (outerPoints.length < 8) break;
+
+    // Filter outliers using median radius
+    outerPoints.sort((a,b) => a.r - b.r);
+    const medR = outerPoints[Math.floor(outerPoints.length / 2)].r;
+    const filteredPoints = outerPoints.filter(p => Math.abs(p.r - medR) < medR * 0.1);
+
+    if (filteredPoints.length < 8) break;
+
+    // Simple algebraic circle fit logic (Kåsa fit) to refine center
+    // For large circles, we can just average the points if they are well distributed,
+    // but a proper fit is better.
+    let sumX = 0, sumY = 0, sumR = 0;
+    for (const p of filteredPoints) {
+      sumX += p.x;
+      sumY += p.y;
+      sumR += p.r;
+    }
+    const newCenter = { x: sumX / filteredPoints.length, y: sumY / filteredPoints.length };
+    const newOuterRadius = sumR / filteredPoints.length;
+
+    // Inner radius logic
+    innerPoints.sort((a,b) => a.r - b.r);
+    const newInnerRadius = innerPoints.length > 4 ? innerPoints[Math.floor(innerPoints.length / 2)].r : newOuterRadius * 0.9;
+
+    // Update state for next iteration
+    if (Math.abs(newCenter.x - currentCenter.x) < 1 && Math.abs(newCenter.y - currentCenter.y) < 1) {
+      currentCenter = newCenter;
+      outerRadius = newOuterRadius;
+      innerRadius = newInnerRadius;
+      break;
+    }
+    currentCenter = newCenter;
+    outerRadius = newOuterRadius;
+    innerRadius = newInnerRadius;
+  }
+
+  if (outerRadius < minRadius) return null;
+
+  return {
+    diameterPixels: outerRadius * 2,
+    innerDiameterPixels: innerRadius * 2,
+    center: currentCenter,
+    region: {
+      xMin: Math.round(currentCenter.x - outerRadius),
+      xMax: Math.round(currentCenter.x + outerRadius),
+      yMin: Math.round(currentCenter.y - outerRadius),
+      yMax: Math.round(currentCenter.y + outerRadius)
+    }
+  };
 }

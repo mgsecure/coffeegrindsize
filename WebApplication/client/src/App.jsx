@@ -69,7 +69,7 @@ function App() {
       <AppBar position="static">
         <Toolbar>
           <Typography variant="h6" component="div" sx={{ flexGrow: 1 }}>
-            Coffee Grind Size Analysis 1
+            Coffee Grind Size Analysis
           </Typography>
         </Toolbar>
       </AppBar>
