@@ -80,9 +80,12 @@ export function registerRoutes(app, { prefix }) {
           results = await analyzeImage(buffer, options);
         } catch (err) {
           logger.error({ err: err.message, stack: err.stack }, 'analyzeImage threw an error');
-          res.status(500).json({ error: 'Error during analysis', message: err.message });
-          return;
-        }
+          // Return stack in response for local debugging if SHOW_STACK=1 is set
+          const resp = { error: 'Error during analysis', message: err.message };
+          if (process.env.SHOW_STACK === '1') resp.stack = err.stack;
+          res.status(500).json(resp);
+           return;
+         }
 
         res.json(results);
        } catch (error) {

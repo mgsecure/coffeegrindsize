@@ -1,5 +1,79 @@
 import sharp from 'sharp';
 import { logger } from '../logger/logger.js';
+import { spawn } from 'child_process';
+import os from 'os';
+import fs from 'fs';
+import path from 'path';
+import {fileURLToPath} from 'url'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+// serverDir should point to WebApplication/server
+const serverDir = path.join(__dirname, '..', '..');
+
+// Calculate cluster metrics used during segmentation. Defined early so analyzeImage can call it.
+function calculateClusterMetrics(indices, width, height, data, median, pixelScale) {
+  // Compute centroid and minimum intensity (darkest pixel)
+  let sumX = 0, sumY = 0;
+  let minZ = 255;
+  for (const idx of indices) {
+    const x = idx % width;
+    const y = Math.floor(idx / width);
+    sumX += x;
+    sumY += y;
+    if (data[idx] < minZ) minZ = data[idx];
+  }
+  const count = indices.length || 1;
+  const xMean = sumX / count;
+  const yMean = sumY / count;
+
+  // Surface measure: weight by darkness relative to median
+  const surfaceMultiplier = Math.max((median - minZ) / Math.max(1, median), 1.0);
+  const surfacePx = indices.length * surfaceMultiplier;
+
+  // Long axis: max distance from centroid
+  let maxD2 = 0;
+  for (const idx of indices) {
+    const x = idx % width;
+    const y = Math.floor(idx / width);
+    const d2 = (x - xMean) ** 2 + (y - yMean) ** 2;
+    if (d2 > maxD2) maxD2 = d2;
+  }
+  const longAxisPx = Math.sqrt(maxD2) || 1e-4;
+
+  // Short axis estimated from surface area assuming elliptical shape: area = pi * a * b
+  const shortAxisPx = surfacePx / (Math.PI * longAxisPx) || 1e-4;
+
+  // Roundness measure (surface relative to circle of radius longAxis)
+  const roundness = surfacePx === 1 ? 1 : surfacePx / (Math.PI * (longAxisPx ** 2));
+
+  // Volume proxy (ellipsoid-like)
+  const volumePx = Math.PI * (shortAxisPx ** 2) * longAxisPx;
+
+  // Convert to mm units
+  const effectivePixelScale = pixelScale || 22.65; // px per mm fallback
+  const surfaceMm2 = surfacePx / (effectivePixelScale ** 2);
+  const longAxisMm = longAxisPx / effectivePixelScale;
+  const shortAxisMm = shortAxisPx / effectivePixelScale;
+  const volumeMm3 = volumePx / (effectivePixelScale ** 3);
+  const diameterMm = 2 * Math.sqrt(longAxisMm * shortAxisMm);
+
+  return {
+    surfacePx,
+    xMean,
+    yMean,
+    longAxisPx,
+    shortAxisPx,
+    roundness,
+    volumePx,
+    pixelCount: indices.length,
+    surfaceMm2,
+    longAxisMm,
+    shortAxisMm,
+    volumeMm3,
+    diameterMm
+  };
+}
 
 /**
  * Perform coffee grind size analysis on an image buffer.
@@ -68,28 +142,90 @@ export async function analyzeImage(buffer, options = {}) {
     // First run the box-based detector to get a reliable center candidate.
     const boxCircle = detectReferenceCircle(data, width, height, medianInitial);
     let circleInfo = null;
-    let detectorUsed = null; // 'gradient' | 'radial' | 'avg' | 'box' | null
+    let detectorUsed = null; // 'gradient' | 'radial' | 'avg' | 'box' | 'hough' | null
+    let usedDetectorDetail = null; // e.g. 'hough:python', 'hough:opencv4nodejs', 'radial'
     let fallbackUsed = false;
 
-    // Try gradient-based detector first (most robust across scales)
+    // Try Hough-circle detection first (node-native OpenCV or Python helper)
+    let hough = null;
     try {
-      const center = boxCircle ? boxCircle.center : null;
-      const grad = detectAnnulusByGradientRadial(data, width, height, medianInitial, center, {});
-      if (grad) {
-        circleInfo = grad;
-        detectorUsed = 'gradient';
+      const houghOptions = {
+        dp: options.houghDp || options.dp,
+        param1: options.houghParam1 || options.param1,
+        param2: options.houghParam2 || options.param2,
+        downsample: options.houghDownsample || options.downsample,
+        minRadius: options.houghMinRadius || options.minRadius,
+        maxRadius: options.houghMaxRadius || options.maxRadius,
+      };
+      hough = await runHoughDetect(buffer, houghOptions);
+      if (hough && hough.center) {
+         // Sanity-check the hough detection before accepting it: center must be inside image bounds
+         // and diameter should be within a reasonable factor of the image size.
+         const imgW = width;
+         const imgH = height;
+         const imgMax = Math.max(imgW, imgH);
+         const imgMin = Math.min(imgW, imgH);
+        const diam = Number(hough.diameterPixels) || null;
+        const cx = Number(hough.center.x) || 0;
+        const cy = Number(hough.center.y) || 0;
+        const plausibleCenter = cx >= 0 && cx <= imgW && cy >= 0 && cy <= imgH;
+        const plausibleSize = diam !== null ? (diam > 10 && diam <= imgMax * 1.25) : false; // allow some tolerance
+
+        // If Hough provides a center, prefer to use the Hough center. If diameter is implausible
+        // or missing, compute robust radii via radial-average sampling around the Hough center.
+        if (!plausibleCenter) {
+          try { logger.warn({ houghRaw: hough.raw || null, houghStderr: hough.stderr || null, houghInputFile: hough.inputFile || null, cx, cy, diam, imgW, imgH }, 'Rejected Hough center (outside image)'); } catch (e) {}
+        } else {
+          // Try to use hough diameter if plausible
+          if (plausibleSize) {
+            circleInfo = {
+              diameterPixels: diam,
+              innerDiameterPixels: hough.innerDiameterPixels || null,
+              center: hough.center,
+              region: { xMin: Math.round(cx - diam / 2), xMax: Math.round(cx + diam / 2), yMin: Math.round(cy - diam / 2), yMax: Math.round(cy + diam / 2) }
+            };
+          } else {
+            // Use radial-average fallback centered at Hough center to compute radii robustly
+            try {
+              const avg = detectAnnulusByRadialProfileAvg(data, width, height, medianInitial, { x: cx, y: cy }, { expectedOuterDiameterPx, minDetectedOuterFraction, minOuterImgFraction });
+              if (avg && avg.diameterPixels > 0) {
+                circleInfo = avg;
+                fallbackUsed = true; // we used radial-average but Hough provided center
+                if (debug) try { logger.info({ houghRaw: hough.raw || null, houghInputFile: hough.inputFile || null, usedAvgFromHoughCenter: true }, 'Hough center used with radial-average to compute radii'); } catch (e) {}
+              }
+            } catch (e) {
+              // ignore and allow other fallbacks to run
+            }
+          }
+
+          // Mark detector as hough (we used the Hough center even if radii came from radial-average)
+          detectorUsed = 'hough';
+          usedDetectorDetail = (hough.source || 'hough') + (hough.helper ? ` (${hough.helper})` : '');
+          if (debug) {
+            try { logger.info({ houghRaw: hough.raw || null, houghStderr: hough.stderr || null, houghInputFile: hough.inputFile || null }, 'Hough helper output'); } catch (e) {}
+          }
+        }
       }
     } catch (e) {
-      // ignore and try next
+      // if Hough fails for any reason, continue to other detectors
     }
 
-    // If gradient didn't find anything, try radial-profile detector
+    // If gradient didn't find anything, try radial-profile detector.
+    // Prefer using the Hough center if available so Hough is considered the detector
+    // even when radii are computed by radial sampling.
     if (!circleInfo) {
-      const center = boxCircle ? boxCircle.center : null;
-      const radial = detectAnnulusByRadialProfile(data, width, height, medianInitial, center, { expectedOuterDiameterPx, minDetectedOuterFraction, minOuterImgFraction });
+      const preferCenter = (hough && hough.center) ? hough.center : (boxCircle ? boxCircle.center : null);
+      const radial = detectAnnulusByRadialProfile(data, width, height, medianInitial, preferCenter, { expectedOuterDiameterPx, minDetectedOuterFraction, minOuterImgFraction });
       if (radial) {
         circleInfo = radial;
-        detectorUsed = 'radial';
+        if (typeof hough !== 'undefined' && hough && hough.center) {
+          // Hough provided the center; preserve 'hough' as the detector
+          detectorUsed = detectorUsed || 'hough';
+          usedDetectorDetail = usedDetectorDetail || 'hough';
+        } else {
+          detectorUsed = 'radial';
+          usedDetectorDetail = 'radial';
+        }
       }
     }
 
@@ -115,6 +251,7 @@ export async function analyzeImage(buffer, options = {}) {
     if (!circleInfo && boxCircle) {
       circleInfo = boxCircle;
       detectorUsed = detectorUsed || 'box';
+      usedDetectorDetail = usedDetectorDetail || 'box';
     }
 
     // Decide on pixel scale and annulus radii using configurable options
@@ -164,7 +301,7 @@ export async function analyzeImage(buffer, options = {}) {
       innerDiameterPx = Math.round(expectedInnerDiameterPx * (outerDiameterPx / expectedOuterDiameterPx));
     }
 
-    logger.info({ calibration: { measuredOuterPx, outerDiameterPx, innerDiameterPx, outerDiameterMm, pixelScale, referenceMode } }, 'Calibration chosen');
+    logger.info({ calibration: { measuredOuterPx, outerDiameterPx, innerDiameterPx, outerDiameterMm, pixelScale, referenceMode }, detector: usedDetectorDetail }, 'Calibration chosen');
 
     // Sanity-check measured inner diameter (if any) — ensure it's a reasonable fraction of the outer diameter.
     if (measuredInnerPx) {
@@ -455,7 +592,10 @@ export async function analyzeImage(buffer, options = {}) {
         usedInnerDiameterPx: innerDiameterPx,
         usedOuterDiameterPx: outerDiameterPx,
         fallbackUsed: initialFallbackUsed,
-        detectorUsed: usedDetector
+        detectorUsed: usedDetector,
+        detectorDetail: usedDetectorDetail,
+        houghRaw: (typeof usedDetectorDetail === 'string' && usedDetectorDetail.startsWith('hough')) ? (circleInfo && circleInfo.raw ? circleInfo.raw : undefined) : undefined,
+        houghInputFile: (typeof usedDetectorDetail === 'string' && usedDetectorDetail.startsWith('hough')) ? (circleInfo && circleInfo.inputFile ? circleInfo.inputFile : undefined) : undefined,
        } : undefined,
     };
 
@@ -881,187 +1021,233 @@ function calculateMedian(data, region = null, width = 0) {
   return 128;
 }
 
-function breakClump(cluster, startIdx, data, width, height, median, options) {
-  const {
-    referenceThreshold = 0.4,
-    maxCost = 0.35,
-    nsmooth = 3,
-    maxClusterAxisPx = 100
-  } = options;
+async function runHoughDetect(buffer, options = {}) {
+  // Try multiple Hough parameter sets (Python helper preferred) and accept the
+  // first plausible detection. This avoids a single fragile parameter choice.
+  const candidates = [
+    { downsample: options.downsample || 1600, dp: options.dp || 1.0, param1: options.param1 || 80, param2: options.param2 || 18 },
+    { downsample: options.downsample || 1200, dp: 1.2, param1: 100, param2: 30 },
+    { downsample: options.downsample || 1200, dp: 1.0, param1: 120, param2: 40 }
+  ];
 
-  const start_x = startIdx % width;
-  const start_y = Math.floor(startIdx / width);
-  const start_z = data[startIdx];
+  const tmpDir = os.tmpdir();
+  for (const cand of candidates) {
+      const tmpFile = path.join(tmpDir, `hough_input_${Date.now()}.jpg`);
+      try {
+        try {
+          fs.writeFileSync(tmpFile, buffer);
+          const py = path.join(serverDir, 'util', 'hough_detect.py');
+          const args = [py, '--input', tmpFile, '--downsample', String(cand.downsample), '--param1', String(cand.param1), '--param2', String(cand.param2), '--dp', String(cand.dp)];
+          const pyRes = await new Promise((resolve) => {
+            const p = spawn('python3', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+            let out = '';
+            let errOut = '';
+            p.stdout.on('data', (chunk) => { out += chunk.toString(); });
+            p.stderr.on('data', (chunk) => { errOut += chunk.toString(); });
+            p.on('close', () => {
+              resolve({ out, errOut });
+            });
+          });
 
-  // Sort cluster by distance to start point
-  cluster.sort((a, b) => {
-    const da = (a % width - start_x) ** 2 + (Math.floor(a / width) - start_y) ** 2;
-    const db = (b % width - start_x) ** 2 + (Math.floor(b / width) - start_y) ** 2;
-    return da - db;
-  });
+          const { out, errOut } = pyRes;
+           if (errOut) {
+             logger.warn({ err: errOut.trim() }, 'Hough detection warning');
+           }
 
-  const filteredCluster = [startIdx];
-  const costs = cluster.map(idx => (data[idx] - start_z) ** 2 / (median ** 2));
-  const clusterToIndex = new Map(cluster.map((idx, i) => [idx, i]));
+          // Try parsing helper output as JSON first (our helper prints JSON), but be resilient
+          // to helper debug text before/after the JSON block. Extract first {...} substring.
+          if (out && out.trim().length > 0) {
+            // try to locate a JSON object in the output
+            let parsed = null;
+            const firstBrace = out.indexOf('{');
+            const lastBrace = out.lastIndexOf('}');
+            if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+              const jsonText = out.substring(firstBrace, lastBrace + 1);
+              try {
+                const j = JSON.parse(jsonText);
+                parsed = j;
+              } catch (e) {
+                // JSON parse failed; fall through to line parsing
+              }
+            }
+            if (!parsed) {
+              // fallback: try to parse any numeric key=value lines
+              try {
+                const h = parseHoughOutput(out);
+                if (h && h.center) return h;
+              } catch (e2) {
+                logger.warn({ parseErr: e2 && e2.message, out }, 'Failed to parse non-JSON hough output');
+              }
+            } else {
+              const j = parsed;
+              if (j && (j.found || (j.cx !== undefined && j.outerRadius !== undefined))) {
+                return { center: { x: j.cx, y: j.cy }, diameterPixels: j.outerRadius * 2, innerDiameterPixels: j.innerRadius ? j.innerRadius * 2 : null, source: 'hough', helper: 'python', raw: j, stderr: errOut, inputFile: tmpFile };
+              }
+            }
+          }
+         } finally {
+          try { fs.unlinkSync(tmpFile); } catch (e) {}
+        }
+      } catch (e) {
+        logger.error({ err: e.message, stack: e.stack }, 'Hough detection error');
+      }
+    }
 
-  for (let i = 0; i < cluster.length; i++) {
-    const idx = cluster[i];
-    if (idx === startIdx) continue;
+    // No candidate produced a usable Hough result: return null so caller falls back
+    return null;
+  }
 
-    // Fast distance check to match Python
-    const d2_to_start = (idx % width - start_x) ** 2 + (Math.floor(idx / width) - start_y) ** 2;
-    if (d2_to_start > maxClusterAxisPx ** 2) continue;
+  function parseHoughOutput(out) {
+    const lines = out.trim().split('\n');
+    const result = {};
+    for (const line of lines) {
+      const m = line.match(/([a-zA-Z0-9_]+)\s*[:=]\s*([0-9\.\-]+)/);
+      if (m) {
+        result[m[1]] = Number(m[2]);
+      }
+    }
+    const diameterPixels = result.diameterPixels || result.outerRadius || null;
+    const center_x = result.cx || result.center_x || null;
+    const center_y = result.cy || result.center_y || null;
+    const inner_diameter_pixels = result.innerRadius || result.inner_diameter_pixels || null;
+    return {
+      diameterPixels: diameterPixels || null,
+      center: { x: center_x || null, y: center_y || null },
+      innerDiameterPixels: inner_diameter_pixels || null,
+      raw: out,
+    };
+  }
 
-    // Find nearest dark pixel already in filtered cluster
-    let nearestDarkIdx = -1;
-    let minDist2 = Infinity;
-    const darkThreshold = (median - start_z) * referenceThreshold + start_z;
+function breakClump(cluster, seedIndex, data, width, height, median, opts = {}) {
+  // Conservative, dependency-free clump breaker:
+  // - Build a local binary mask for the cluster in its bounding box
+  // - Perform several iterations of pruning (remove pixels with <=1 neighbor) to try to thin bridges
+  // - Extract connected components; return the component that contains the original seedIndex
+  // If no split is found, return the original cluster.
+  if (!cluster || cluster.length <= 1) return cluster;
 
-    for (const fIdx of filteredCluster) {
-      if (data[fIdx] <= darkThreshold) {
-        const d2 = (idx % width - fIdx % width) ** 2 + (Math.floor(idx / width) - Math.floor(fIdx / width)) ** 2;
-        if (d2 < minDist2) {
-          minDist2 = d2;
-          nearestDarkIdx = fIdx;
+  // Compute bounding box
+  let minX = width, minY = height, maxX = 0, maxY = 0;
+  for (const idx of cluster) {
+    const x = idx % width;
+    const y = Math.floor(idx / width);
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+
+  // Pad bounding box by 1 to avoid edge issues
+  minX = Math.max(0, minX - 1);
+  minY = Math.max(0, minY - 1);
+  maxX = Math.min(width - 1, maxX + 1);
+  maxY = Math.min(height - 1, maxY + 1);
+  const wBox = maxX - minX + 1;
+  const hBox = maxY - minY + 1;
+
+  // Map cluster indices into mask
+  const mask = new Uint8Array(wBox * hBox);
+  const idxSet = new Set(cluster);
+  for (const idx of cluster) {
+    const x = idx % width;
+    const y = Math.floor(idx / width);
+    const bx = x - minX;
+    const by = y - minY;
+    mask[by * wBox + bx] = 1;
+  }
+
+  // Iteratively prune endpoints: pixels with <= 1 neighbor (4-neighbors)
+  const maxIter = 20;
+  let changed = true;
+  let iter = 0;
+  while (changed && iter < maxIter) {
+    changed = false;
+    iter++;
+    const toRemove = [];
+    for (let by = 0; by < hBox; by++) {
+      for (let bx = 0; bx < wBox; bx++) {
+        const p = by * wBox + bx;
+        if (!mask[p]) continue;
+        let neigh = 0;
+        if (bx > 0 && mask[p - 1]) neigh++;
+        if (bx < wBox - 1 && mask[p + 1]) neigh++;
+        if (by > 0 && mask[p - wBox]) neigh++;
+        if (by < hBox - 1 && mask[p + wBox]) neigh++;
+        if (neigh <= 1) toRemove.push(p);
+      }
+    }
+    if (toRemove.length === 0) break;
+    for (const p of toRemove) {
+      mask[p] = 0;
+      changed = true;
+    }
+  }
+
+  // Find connected components in the pruned mask (4-connectivity)
+  const visited = new Uint8Array(wBox * hBox);
+  const components = [];
+  for (let by = 0; by < hBox; by++) {
+    for (let bx = 0; bx < wBox; bx++) {
+      const p = by * wBox + bx;
+      if (!mask[p] || visited[p]) continue;
+      // BFS
+      const comp = [];
+      const q = [p];
+      visited[p] = 1;
+      while (q.length > 0) {
+        const cur = q.shift();
+        comp.push(cur);
+        const cx = cur % wBox;
+        const cy = Math.floor(cur / wBox);
+        const neighbors = [];
+        if (cx > 0) neighbors.push(cur - 1);
+        if (cx < wBox - 1) neighbors.push(cur + 1);
+        if (cy > 0) neighbors.push(cur - wBox);
+        if (cy < hBox - 1) neighbors.push(cur + wBox);
+        for (const nb of neighbors) {
+          if (!visited[nb] && mask[nb]) {
+            visited[nb] = 1;
+            q.push(nb);
+          }
         }
       }
-    }
-
-    if (nearestDarkIdx === -1) continue;
-    if (idx === nearestDarkIdx) {
-      filteredCluster.push(idx);
-      continue;
-    }
-
-    // Path check logic
-    const x1 = idx % width;
-    const y1 = Math.floor(idx / width);
-    const x2 = nearestDarkIdx % width;
-    const y2 = Math.floor(nearestDarkIdx / width);
-
-    const path = getPathIndices(x1, y1, x2, y2, width, height, new Set(cluster));
-    if (!path) continue;
-
-    const pathCosts = path.map(pIdx => costs[clusterToIndex.get(pIdx)]);
-    const maxPathCost = getMaxSmoothedCost(pathCosts, nsmooth);
-
-    if (maxPathCost < maxCost) {
-      filteredCluster.push(idx);
+      components.push(comp);
     }
   }
 
-  return filteredCluster;
-}
+  // If only one component, no split happened; return original cluster
+  if (components.length <= 1) return cluster;
 
-function getPathIndices(x1, y1, x2, y2, width, height, clusterSet) {
-  const path = [];
-  const dx = Math.abs(x2 - x1);
-  const dy = Math.abs(y2 - y1);
-  const sx = (x1 < x2) ? 1 : -1;
-  const sy = (y1 < y2) ? 1 : -1;
-  let err = dx - dy;
+  // Identify which component contains the seedIndex; map seedIndex into box coords
+  const seedX = seedIndex % width;
+  const seedY = Math.floor(seedIndex / width);
+  const seedBx = seedX - minX;
+  const seedBy = seedY - minY;
+  const seedP = seedBy * wBox + seedBx;
 
-  let currX = x1;
-  let currY = y1;
-
-  while (true) {
-    const idx = currY * width + currX;
-    if (!clusterSet.has(idx)) return null; // Path broken
-    path.push(idx);
-
-    if (currX === x2 && currY === y2) break;
-    const e2 = 2 * err;
-    if (e2 > -dy) {
-      err -= dy;
-      currX += sx;
-    }
-    if (e2 < dx) {
-      err += dx;
-      currY += sy;
-    }
-  }
-  return path;
-}
-
-function getMaxSmoothedCost(costs, windowSize) {
-  if (costs.length === 0) return 0;
-  if (windowSize >= costs.length) {
-    return (costs.reduce((a, b) => a + b, 0) / costs.length) * windowSize;
+  let chosenComp = null;
+  for (const comp of components) {
+    if (comp.includes(seedP)) { chosenComp = comp; break; }
   }
 
-  let maxVal = 0;
-  for (let i = 0; i < costs.length; i++) {
-    let sum = 0;
-    let count = 0;
-    const half = Math.floor(windowSize / 2);
-    for (let j = i - half; j <= i + half; j++) {
-      if (j >= 0 && j < costs.length) {
-        sum += costs[j];
-        count++;
-      }
-    }
-    const val = sum * (windowSize / count);
-    if (val > maxVal) maxVal = val;
-  }
-  return maxVal;
-}
-
-function calculateClusterMetrics(indices, width, height, data, median, pixelScale) {
-  // Centroid and minZ
-  let sumX = 0, sumY = 0;
-  let minZ = 255;
-  for (const idx of indices) {
-    const x = idx % width;
-    const y = Math.floor(idx / width);
-    sumX += x;
-    sumY += y;
-    if (data[idx] < minZ) minZ = data[idx];
+  if (!chosenComp) {
+    // fallback: pick the largest component
+    chosenComp = components.sort((a,b)=>b.length-a.length)[0];
   }
 
-  const count = indices.length || 1;
-  const xMean = sumX / count;
-  const yMean = sumY / count;
-
-  // Surface multiplier: dark pixels contribute more
-  const surfaceMultiplier = Math.max((median - minZ) / median, 1.0);
-  const surfacePx = indices.length * surfaceMultiplier;
-
-  // Long axis = max distance from centroid
-  let maxD2 = 0;
-  for (const idx of indices) {
-    const x = idx % width;
-    const y = Math.floor(idx / width);
-    const d2 = (x - xMean) ** 2 + (y - yMean) ** 2;
-    if (d2 > maxD2) maxD2 = d2;
+  // Map chosen component back to global indices
+  const out = [];
+  for (const p of chosenComp) {
+    const bx = p % wBox;
+    const by = Math.floor(p / wBox);
+    const gx = bx + minX;
+    const gy = by + minY;
+    out.push(gy * width + gx);
   }
-  const longAxisPx = Math.sqrt(maxD2) || 1e-4;
 
-  // Roundness and short axis
-  const roundness = surfacePx === 1 ? 1 : surfacePx / (Math.PI * (longAxisPx ** 2));
-  const shortAxisPx = surfacePx / (Math.PI * longAxisPx);
-  const volumePx = Math.PI * (shortAxisPx ** 2) * longAxisPx;
-
-  // Convert to mm
-  const effectivePixelScale = pixelScale || 22.65;
-  const surfaceMm2 = surfacePx / (effectivePixelScale ** 2);
-  const longAxisMm = longAxisPx / effectivePixelScale;
-  const shortAxisMm = shortAxisPx / effectivePixelScale;
-  const volumeMm3 = volumePx / (effectivePixelScale ** 3);
-  const diameterMm = 2 * Math.sqrt(longAxisMm * shortAxisMm);
-
-  return {
-    surfacePx,
-    xMean,
-    yMean,
-    longAxisPx,
-    shortAxisPx,
-    roundness,
-    volumePx,
-    pixelCount: indices.length,
-    surfaceMm2,
-    longAxisMm,
-    shortAxisMm,
-    volumeMm3,
-    diameterMm
-  };
+  // If the chosen piece is too small (less than half), return original cluster to be conservative
+  if (out.length < Math.max(1, Math.round(cluster.length * 0.25))) {
+    return cluster;
+  }
+  return out;
 }
