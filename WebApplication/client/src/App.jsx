@@ -6,11 +6,13 @@ import {
   ToggleButton, ToggleButtonGroup, Divider
 } from '@mui/material'
 import axios from 'axios'
+import Histogram from './Histogram.jsx'
 
 function App() {
   const [selectedFile, setSelectedFile] = useState(null)
   const [previewUrl, setPreviewUrl] = useState(null)
   const [results, setResults] = useState(null)
+  const [terseResults, setTerseResults] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
 
@@ -22,6 +24,10 @@ function App() {
   const [minRoundness, setMinRoundness] = useState(0)
   const [referenceThreshold, setReferenceThreshold] = useState(0.4)
   const [maxCost, setMaxCost] = useState(0.35)
+  const [brightness, setBrightness] = useState(1.0)
+  const [contrast, setContrast] = useState(1.0)
+  const [referenceMode, setReferenceMode] = useState('detected')
+  const [debug, setDebug] = useState(false)
   const [quick, setQuick] = useState(true)
   const [histogramScale, setHistogramScale] = useState('log') // linear, log
   const [histogramMetric, setHistogramMetric] = useState('diameter') // 'diameter' | 'surface'
@@ -32,6 +38,7 @@ function App() {
     if (file) {
       setSelectedFile(file)
       setPreviewUrl(URL.createObjectURL(file))
+      setDisplayType('original')
       setResults(null)
     }
   }
@@ -51,11 +58,21 @@ function App() {
     formData.append('minRoundness', minRoundness)
     formData.append('referenceThreshold', referenceThreshold)
     formData.append('maxCost', maxCost)
+    formData.append('brightness', brightness)
+    formData.append('contrast', contrast)
+    formData.append('referenceMode', referenceMode)
+    formData.append('debug', debug)
     formData.append('quick', quick)
+
 
     try {
       const response = await axios.post('/api/analyze', formData)
       setResults(response.data)
+      setDisplayType('thresholded')
+      const resultsCopy = { ...response.data }
+      delete resultsCopy.thresholdImage
+      delete resultsCopy.outlinesImage
+      setTerseResults(resultsCopy)
     } catch (err) {
       console.error(err)
       setError('Error during analysis. Please try again.')
@@ -63,6 +80,73 @@ function App() {
       setLoading(false)
     }
   }
+
+  const particles = results?.particles || [];
+  // X-axis values depend on selected metric
+  const values = particles.map(p => histogramMetric === 'diameter' ? p.diameterMm : p.surfaceMm2);
+  let min = Math.min(...values);
+  let max = histogramMetric === 'diameter' ? (maxClusterAxis || Math.max(...values, 5)) : (maxClusterAxis ||  Math.max(...values, 5));
+
+  // Ensure min is positive for log scale
+  if (histogramScale === 'log' && min <= 0) {
+    min = 0.01;
+  }
+
+  const binCount = 30;
+  let bins = [];
+
+  if (histogramScale === 'log') {
+    const logMin = Math.log10(min);
+    const logMax = Math.log10(max);
+    const step = (logMax - logMin) / binCount;
+    for (let i = 0; i <= binCount; i++) {
+      bins.push(Math.pow(10, logMin + i * step));
+    }
+  } else {
+    const step = (max - min) / binCount;
+    for (let i = 0; i <= binCount; i++) {
+      bins.push(min + i * step);
+    }
+  }
+
+  const binMasses = new Array(binCount).fill(0);
+  const binCounts = new Array(binCount).fill(0);
+  let totalMass = 0;
+
+  particles.forEach(p => {
+    const v = histogramMetric === 'diameter' ? p.diameterMm : p.surfaceMm2;
+    let binIdx;
+    if (histogramScale === 'log') {
+      if (v <= bins[0]) binIdx = 0;
+      else if (v >= bins[binCount]) binIdx = binCount - 1;
+      else {
+        binIdx = Math.floor((Math.log10(v) - Math.log10(bins[0])) / (Math.log10(bins[1]) - Math.log10(bins[0])));
+        binIdx = Math.min(binIdx, binCount - 1);
+      }
+    } else {
+      binIdx = Math.min(Math.floor((v - min) / (bins[1] - bins[0])), binCount - 1);
+    }
+    if (binIdx >= 0) {
+      binMasses[binIdx] += p.volumeMm3; // mass is volume in mm^3
+      binCounts[binIdx]++;
+      totalMass += p.volumeMm3;
+    }
+  });
+
+  const binPercentages = binMasses.map(mass => (mass / totalMass) * 100);
+
+  const binData = {
+    bins,
+    binCounts,
+    binPercentages,
+    histogramScale,
+    histogramMetric,
+    maxClusterAxis,
+    min,
+    max,
+    statistics: results?.statistics
+  }
+
 
   return (
     <Box sx={{ flexGrow: 1 }}>
@@ -76,7 +160,7 @@ function App() {
       <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
         <Grid container spacing={3}>
           {/* Left Panel: Controls */}
-          <Grid item xs={12} md={4}>
+          <Grid xs={12} md={4}>
             <Paper sx={{ p: 2 }}>
               <Typography variant="h6" gutterBottom>Settings</Typography>
               <Button
@@ -98,6 +182,32 @@ function App() {
                 margin="normal"
                 size="small"
               />
+              <Grid container spacing={1}>
+                <Grid item xs={6}>
+                  <TextField
+                    label="Brightness"
+                    type="number"
+                    value={brightness}
+                    onChange={(e) => setBrightness(e.target.value)}
+                    fullWidth
+                    margin="normal"
+                    size="small"
+                    inputProps={{ step: 0.1 }}
+                  />
+                </Grid>
+                <Grid item xs={6}>
+                  <TextField
+                    label="Contrast"
+                    type="number"
+                    value={contrast}
+                    onChange={(e) => setContrast(e.target.value)}
+                    fullWidth
+                    margin="normal"
+                    size="small"
+                    inputProps={{ step: 0.1 }}
+                  />
+                </Grid>
+              </Grid>
               <TextField
                 label="Max Cluster Axis (mm)"
                 type="number"
@@ -161,6 +271,24 @@ function App() {
                 label="Quick Analysis"
               />
 
+              <ToggleButtonGroup
+                value={referenceMode}
+                exclusive
+                onChange={(e, next) => next && setReferenceMode(next)}
+                size="small"
+                fullWidth
+                sx={{ mb: 2 }}
+              >
+                <ToggleButton value="detected">Detected</ToggleButton>
+                <ToggleButton value="auto">Auto</ToggleButton>
+                <ToggleButton value="fixed">Fixed</ToggleButton>
+              </ToggleButtonGroup>
+
+              <FormControlLabel
+                control={<Switch checked={debug} onChange={(e) => setDebug(e.target.checked)} />}
+                label="Debug Mode"
+              />
+
               <Button
                 variant="contained"
                 color="primary"
@@ -175,7 +303,7 @@ function App() {
           </Grid>
 
           {/* Right Panel: Preview & Results */}
-          <Grid item xs={12} md={8}>
+          <Grid xs={12} md={8}>
             {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
             
             <Paper sx={{ p: 2, textAlign: 'center', minHeight: 400 }}>
@@ -198,6 +326,12 @@ function App() {
                     {displayType === 'thresholded' && results?.thresholdImage && <img src={results.thresholdImage} alt="Thresholded" style={{ maxWidth: '100%', maxHeight: 600 }} />}
                     {displayType === 'outlines' && results?.outlinesImage && <img src={results.outlinesImage} alt="Outlines" style={{ maxWidth: '100%', maxHeight: 600 }} />}
                   </Box>
+                  {results?.debug && (
+                    <Box sx={{ mt: 2, textAlign: 'left', p: 1, bgcolor: '#f5f5f5', borderRadius: 1, fontSize: '0.8rem' }}>
+                      <Typography variant="caption" display="block"><b>Debug Info:</b></Typography>
+                      <pre style={{ margin: 0, overflow: 'auto' }}>{JSON.stringify(results.debug, null, 2)}</pre>
+                    </Box>
+                  )}
                 </Box>
               ) : (
                 <Typography variant="body1" sx={{ mt: 10 }}>
@@ -212,6 +346,12 @@ function App() {
                 <TableContainer component={Paper}>
                   <Table size="small">
                     <TableBody>
+                      {selectedFile?.name && (
+                          <TableRow>
+                            <TableCell component="th" scope="row">Filename</TableCell>
+                            <TableCell align="right">{selectedFile.name}</TableCell>
+                          </TableRow>
+                      )}
                       <TableRow>
                         <TableCell component="th" scope="row">Image Size</TableCell>
                         <TableCell align="right">{results.width} x {results.height}</TableCell>
@@ -259,128 +399,7 @@ function App() {
                 </TableContainer>
 
                 {results.pixelScale && results.particles.length > 0 && (
-                  <Box sx={{ mt: 3 }}>
-                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
-                      <Typography variant="h6">Size Distribution (% Mass vs {histogramMetric === 'diameter' ? 'Diameter (mm)' : 'Surface (mm²)'})</Typography>
-                      <ToggleButtonGroup
-                        value={histogramScale}
-                        exclusive
-                        onChange={(e, next) => next && setHistogramScale(next)}
-                        size="small"
-                      >
-                        <ToggleButton value="log">Log</ToggleButton>
-                        <ToggleButton value="linear">Linear</ToggleButton>
-                      </ToggleButtonGroup>
-                      <ToggleButtonGroup
-                        value={histogramMetric}
-                        exclusive
-                        onChange={(e, next) => next && setHistogramMetric(next)}
-                        size="small"
-                        sx={{ ml: 1 }}
-                      >
-                        <ToggleButton value="diameter">Diameter</ToggleButton>
-                        <ToggleButton value="surface">Surface</ToggleButton>
-                      </ToggleButtonGroup>
-                    </Box>
-                    <Paper sx={{ p: 2 }}>
-                      <Box sx={{ display: 'flex', alignItems: 'flex-end', height: 250, width: 650, gap: '2px' }}>
-                        {(() => {
-                          const particles = results.particles;
-                          // X-axis values depend on selected metric
-                          const values = particles.map(p => histogramMetric === 'diameter' ? p.diameterMm : p.surfaceMm2);
-                          let min = Math.min(...values);
-                          let max = Math.max(...values);
-
-                          // Ensure min is positive for log scale
-                          if (histogramScale === 'log' && min <= 0) {
-                             min = 0.01;
-                          }
-                          
-                          const binCount = 20;
-                          let bins = [];
-                          
-                          if (histogramScale === 'log') {
-                            const logMin = Math.log10(min);
-                            const logMax = Math.log10(max);
-                            const step = (logMax - logMin) / binCount;
-                            for (let i = 0; i <= binCount; i++) {
-                              bins.push(Math.pow(10, logMin + i * step));
-                            }
-                          } else {
-                            const step = (max - min) / binCount;
-                            for (let i = 0; i <= binCount; i++) {
-                              bins.push(min + i * step);
-                            }
-                          }
-                          
-                          const binMasses = new Array(binCount).fill(0);
-                          const binCounts = new Array(binCount).fill(0);
-                          let totalMass = 0;
-                          
-                          particles.forEach(p => {
-                            const v = histogramMetric === 'diameter' ? p.diameterMm : p.surfaceMm2;
-                            let binIdx;
-                            if (histogramScale === 'log') {
-                              if (v <= bins[0]) binIdx = 0;
-                              else if (v >= bins[binCount]) binIdx = binCount - 1;
-                              else {
-                                binIdx = Math.floor((Math.log10(v) - Math.log10(bins[0])) / (Math.log10(bins[1]) - Math.log10(bins[0])));
-                                binIdx = Math.min(binIdx, binCount - 1);
-                              }
-                            } else {
-                              binIdx = Math.min(Math.floor((v - min) / (bins[1] - bins[0])), binCount - 1);
-                            }
-                            if (binIdx >= 0) {
-                              binMasses[binIdx] += p.volumeMm3; // mass is volume in mm^3
-                              binCounts[binIdx]++;
-                              totalMass += p.volumeMm3;
-                            }
-                          });
-
-                           const binPercentages = binMasses.map(mass => (mass / totalMass) * 100);
-                           const maxPercentage = Math.max(...binPercentages, 0.01);
-
-                          return binPercentages.map((percentage, i) => (
-                            <Box 
-                              key={i} 
-                              sx={{ 
-                                flex: 1, 
-                                bgcolor: 'primary.main', 
-                                height: `${(percentage / maxPercentage) * 100}%`,
-                                minWidth: '5px'
-                              }} 
-                              title={`Bin ${i}: ${bins[i].toFixed(3)}-${bins[i+1].toFixed(3)} ${histogramMetric === 'diameter' ? 'mm' : 'mm²'}\nMass: ${percentage.toFixed(2)}%\nCount: ${binCounts[i]}`}
-                            />
-                          ));
-                        })()}
-                      </Box>
-                      <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 1 }}>
-                        {(() => {
-                           const valuesForLabels = results.particles.map(p => histogramMetric === 'diameter' ? p.diameterMm : p.surfaceMm2);
-                           const min = Math.min(...valuesForLabels);
-                           const max = Math.max(...valuesForLabels);
-                           const unit = histogramMetric === 'diameter' ? 'mm' : 'mm²';
-                           if (histogramScale === 'log') {
-                             // Show more labels for log scale
-                             const labels = [];
-                             const logMin = Math.log10(min > 0 ? min : 0.01);
-                             const logMax = Math.log10(max);
-                             for (let i = 0; i <= 4; i++) {
-                               const val = Math.pow(10, logMin + (i/4) * (logMax - logMin));
-                               labels.push(<Typography key={i} variant="caption">{val.toFixed(2)}{unit}</Typography>);
-                             }
-                             return labels;
-                           }
-                           return (
-                             <>
-                               <Typography variant="caption">{min.toFixed(2)}{unit}</Typography>
-                               <Typography variant="caption">{max.toFixed(2)}{unit}</Typography>
-                             </>
-                           )
-                        })()}
-                      </Box>
-                    </Paper>
-                  </Box>
+                  <Histogram binData={binData} histogramScale={histogramScale} setHistogramScale={setHistogramScale} histogramMetric={histogramMetric} setHistogramMetric={setHistogramMetric} maxClusterAxis={maxClusterAxis}/>
                 )}
               </Box>
             )}

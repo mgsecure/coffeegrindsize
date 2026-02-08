@@ -16,7 +16,7 @@ async function runOne(buf, opts, label, outDir) {
 async function run() {
   const __filename = fileURLToPath(import.meta.url);
   const __dirname = path.dirname(__filename);
-  const samplePath = path.join(__dirname, '..', '..', 'client', 'src', 'resources', 'circle-93mm.jpeg');
+  const samplePath = path.join(__dirname, '..', '..', 'client', 'src', 'resources', 'circle-93mm.jpg');
 
   try {
     const buf = await fs.readFile(samplePath);

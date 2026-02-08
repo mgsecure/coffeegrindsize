@@ -9,6 +9,7 @@ Quick start (end user)
 2. Upload an image (the image should show the dark annulus and particles inside it). Two sample images are included in `WebApplication/client/src/resources/`.
 3. Configure options on the UI (defaults match the target annulus):
    - Quick analysis (on/off): if off, analysis runs a more thorough clustering step (slower but may produce better separation of touching particles).
+   - Brightness / Contrast: Adjust image brightness and contrast before analysis. This can help the annulus detector in poor lighting conditions.
    - Reference mode: Always detected (default) — analyzer will use the measured annulus diameter from the image. Alternate modes: `auto` or `fixed`.
 4. Click Analyze. Results include:
    - `pixelScale` (pix/mm)
@@ -43,6 +44,8 @@ Server API (simple)
 - Form fields:
   - `image`: file upload (required)
   - `quick`: 'true' | 'false'
+  - `brightness`: numeric (default 1.0)
+  - `contrast`: numeric (default 1.0)
   - Optional numeric tuning fields: `threshold`, `maxClusterAxis`, `minSurface`, `maxSurface`, `minRoundness`
 - Response: JSON object with `pixelScale`, `particleCount`, `statistics`, `thresholdImage`, `outlinesImage`, `calibration`, and `debug` (only when `debug` enabled).
 

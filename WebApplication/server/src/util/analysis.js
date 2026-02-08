@@ -1,15 +1,5 @@
 import sharp from 'sharp';
 import { logger } from '../logger/logger.js';
-import { spawn } from 'child_process';
-import os from 'os';
-import fs from 'fs';
-import path from 'path';
-import {fileURLToPath} from 'url'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
-// serverDir should point to WebApplication/server
-const serverDir = path.join(__dirname, '..', '..');
 
 // Calculate cluster metrics used during segmentation. Defined early so analyzeImage can call it.
 function calculateClusterMetrics(indices, width, height, data, median, pixelScale) {
@@ -39,7 +29,9 @@ function calculateClusterMetrics(indices, width, height, data, median, pixelScal
     const d2 = (x - xMean) ** 2 + (y - yMean) ** 2;
     if (d2 > maxD2) maxD2 = d2;
   }
-  const longAxisPx = Math.sqrt(maxD2) || 1e-4;
+  // Use a small constant to account for pixel extent; 
+  // at lower resolutions, a single pixel represents a larger physical area.
+  const longAxisPx = Math.sqrt(maxD2) + 0.25; 
 
   // Short axis estimated from surface area assuming elliptical shape: area = pi * a * b
   const shortAxisPx = surfacePx / (Math.PI * longAxisPx) || 1e-4;
@@ -85,8 +77,10 @@ export async function analyzeImage(buffer, options = {}) {
     }
     const {
       threshold = 58.8,
-      maxClusterAxis = 2,
-      minSurface = 0.05,
+      brightness = 1.0,
+      contrast = 1.0,
+      maxClusterAxis = 5,
+      minSurface = 0.01,
       maxSurface = 10,
       minRoundness = 0,
       quick = true,
@@ -99,9 +93,9 @@ export async function analyzeImage(buffer, options = {}) {
       minDetectedOuterFraction = 0.6,
       minOuterImgFraction = 0.1,
       // Calibration and reference options (configurable)
-      expectedOuterDiameterPx = 1744, // outside diameter in pixels (default measured target)
-      expectedInnerDiameterPx = 1580, // inside diameter in pixels
-      outerDiameterMm = 93, // physical outer diameter in mm
+      expectedOuterDiameterPx = 2307, // outside diameter in pixels (default measured target)
+      expectedInnerDiameterPx = 2166, // inside diameter in pixels (169mm at 12.82 pix/mm)
+      outerDiameterMm = 180, // physical outer diameter in mm
       diameterTolerancePx = 10, // tolerance to decide whether to trust detected diameter
       edgeTolerancePx = 1.5, // pixels near inner/outer boundaries considered "edge"
       // referenceMode: 'auto' | 'fixed' | 'detected'
@@ -113,7 +107,23 @@ export async function analyzeImage(buffer, options = {}) {
     } = options;
 
     // 1. Load image and get blue channel
-    const image = sharp(buffer);
+    let image = sharp(buffer);
+
+    // Apply brightness/contrast if specified
+    if (brightness !== 1.0 || contrast !== 1.0) {
+      // sharp .modulate({ brightness: factor }) uses 1.0 as identity
+      // sharp .linear(multiplier, offset) can be used for contrast
+      // contrast = 1.0 is identity. 
+      // y = contrast * x + offset
+      // To keep mean/midpoint: y = contrast * (x - 128) + 128 * brightness
+      if (brightness !== 1.0) {
+        image = image.modulate({ brightness });
+      }
+      if (contrast !== 1.0) {
+        image = image.linear(contrast, -(128 * contrast) + 128);
+      }
+    }
+
     const metadata = await image.metadata();
     const { width, height } = metadata;
 
@@ -143,8 +153,10 @@ export async function analyzeImage(buffer, options = {}) {
     // Primary Pure JS Detector: Iterative Radial Gradient
     circleInfo = detectAnnulusIterative(data, width, height, medianInitial, initialCenter, {
       expectedOuterDiameterPx,
+      expectedInnerDiameterPx,
       minDetectedOuterFraction,
-      minOuterImgFraction
+      minOuterImgFraction,
+      debug
     });
 
     if (circleInfo) {
@@ -351,8 +363,23 @@ export async function analyzeImage(buffer, options = {}) {
     // Sort thresholded indices by brightness to match Python (darkest first)
     thresholdedIndices.sort((a, b) => data[a] - data[b]);
 
+    // Apply a simple noise filter: remove isolated thresholded pixels
+    const denoisedMask = new Uint8Array(mask.length);
+    for (const idx of thresholdedIndices) {
+      const x = idx % width;
+      const y = Math.floor(idx / width);
+      let neighborsCount = 0;
+      if (x > 0 && mask[idx - 1]) neighborsCount++;
+      if (x < width - 1 && mask[idx + 1]) neighborsCount++;
+      if (y > 0 && mask[idx - width]) neighborsCount++;
+      if (y < height - 1 && mask[idx + width]) neighborsCount++;
+      if (neighborsCount >= 1) {
+        denoisedMask[idx] = 1;
+      }
+    }
+
     for (const index of thresholdedIndices) {
-      if (visited[index]) continue;
+      if (!denoisedMask[index] || visited[index]) continue;
 
       let cluster = [];
       let queue = [index];
@@ -379,7 +406,7 @@ export async function analyzeImage(buffer, options = {}) {
         for (const [nx, ny] of neighbors) {
           if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
             const nIdx = ny * width + nx;
-            if (mask[nIdx] && !visited[nIdx]) {
+            if (denoisedMask[nIdx] && !visited[nIdx]) {
               // Distance check to avoid huge clusters early if we want to match Python's max_cluster_axis
               const nx_val = nIdx % width;
               const ny_val = Math.floor(nIdx / width);
@@ -528,6 +555,7 @@ export async function analyzeImage(buffer, options = {}) {
         fallbackUsed: initialFallbackUsed,
         detectorUsed: usedDetector,
         detectorDetail: usedDetectorDetail,
+        center: circleCenter,
         houghRaw: (typeof usedDetectorDetail === 'string' && usedDetectorDetail.startsWith('hough')) ? (circleInfo && circleInfo.raw ? circleInfo.raw : undefined) : undefined,
         houghInputFile: (typeof usedDetectorDetail === 'string' && usedDetectorDetail.startsWith('hough')) ? (circleInfo && circleInfo.inputFile ? circleInfo.inputFile : undefined) : undefined,
        } : undefined,
@@ -1056,6 +1084,9 @@ function breakClump(cluster, seedIndex, data, width, height, median, opts = {}) 
   // If only one component, no split happened; return original cluster
   if (components.length <= 1) return cluster;
 
+  // Filter components: only keep those with reasonable shape/size if we wanted to be aggressive
+  // but here we just want to break bridges. 
+
   // Identify which component contains the seedIndex; map seedIndex into box coords
   const seedX = seedIndex % width;
   const seedY = Math.floor(seedIndex / width);
@@ -1096,16 +1127,16 @@ function detectAnnulusIterative(data, width, height, median, initialCenter, opts
   // 2. Fits a circle to those points to refine center and radius.
   // 3. Repeats to converge.
 
-  const { expectedOuterDiameterPx = 1744, minDetectedOuterFraction = 0.6 } = opts;
+  const { expectedOuterDiameterPx = 1744, expectedInnerDiameterPx = 1500, minDetectedOuterFraction = 0.6, debug = false } = opts;
   const expectedRadius = expectedOuterDiameterPx / 2;
   const minRadius = expectedRadius * minDetectedOuterFraction;
   const circleThreshold = (median * 40) / 100;
 
   let currentCenter = { ...initialCenter };
   let outerRadius = expectedRadius;
-  let innerRadius = expectedRadius * 0.9;
+  let innerRadius = expectedRadius * (expectedInnerDiameterPx / expectedOuterDiameterPx);
 
-  const maxIterations = 3;
+  const maxIterations = 8;
   for (let iter = 0; iter < maxIterations; iter++) {
     const rays = 72; // every 5 degrees
     const outerPoints = [];
@@ -1116,7 +1147,7 @@ function detectAnnulusIterative(data, width, height, median, initialCenter, opts
       const cos = Math.cos(theta);
       const sin = Math.sin(theta);
 
-      // Search for outer edge (strong negative gradient)
+      // Search for outer edge (strong positive gradient: Dark -> Light)
       // Search range: [expectedRadius * 0.5, expectedRadius * 1.5]
       let bestGrad = 0;
       let bestR = null;
@@ -1131,35 +1162,51 @@ function detectAnnulusIterative(data, width, height, median, initialCenter, opts
         const idx = y * width + x;
         // Radial gradient approximated by central difference along ray
         // (Next - Prev) along the direction of the ray
-        const rNext = Math.round(currentCenter.x + (r+1) * cos) + Math.round(currentCenter.y + (r+1) * sin) * width;
-        const rPrev = Math.round(currentCenter.x + (r-1) * cos) + Math.round(currentCenter.y + (r-1) * sin) * width;
-        const grad = data[rNext] - data[rPrev];
+        const rNextX = Math.round(currentCenter.x + (r + 1) * cos);
+        const rNextY = Math.round(currentCenter.y + (r + 1) * sin);
+        const rPrevX = Math.round(currentCenter.x + (r - 1) * cos);
+        const rPrevY = Math.round(currentCenter.y + (r - 1) * sin);
 
-        if (grad < bestGrad) {
+        if (rNextX < 0 || rNextX >= width || rNextY < 0 || rNextY >= height ||
+            rPrevX < 0 || rPrevX >= width || rPrevY < 0 || rPrevY >= height) continue;
+
+        const grad = data[rNextY * width + rNextX] - data[rPrevY * width + rPrevX];
+
+        if (grad > bestGrad) {
           bestGrad = grad;
           bestR = r;
         }
       }
 
-      if (bestR && bestGrad < -5) { // Threshold for "sharp enough" edge
-        outerPoints.push({ x: currentCenter.x + bestR * cos, y: currentCenter.y + bestR * sin, r: bestR });
+      if (bestR && bestGrad > 5) { // Threshold for "sharp enough" edge
+        outerPoints.push({ x: currentCenter.x + bestR * cos, y: currentCenter.y + bestR * sin, r: bestR, grad: bestGrad });
       }
 
-      // Search for inner edge (strong positive gradient inside outer edge)
+      // Search for inner edge (strong negative gradient inside outer edge: Light -> Dark)
       if (bestR) {
         let bestInnerGrad = 0;
         let bestInnerR = null;
-        for (let r = Math.round(bestR * 0.5); r < bestR; r++) {
+        // Search for inner edge, preferring something close to outer edge
+        for (let r = bestR - 1; r > Math.round(bestR * 0.5); r--) {
           const x = Math.round(currentCenter.x + r * cos);
           const y = Math.round(currentCenter.y + r * sin);
           if (x < 1 || x >= width - 1 || y < 1 || y >= height - 1) break;
-          const rNext = Math.round(currentCenter.x + (r+1) * cos) + Math.round(currentCenter.y + (r+1) * sin) * width;
-          const rPrev = Math.round(currentCenter.x + (r-1) * cos) + Math.round(currentCenter.y + (r-1) * sin) * width;
-          const grad = data[rNext] - data[rPrev];
-          if (grad > bestInnerGrad) {
+          const rNextX = Math.round(currentCenter.x + (r + 1) * cos);
+          const rNextY = Math.round(currentCenter.y + (r + 1) * sin);
+          const rPrevX = Math.round(currentCenter.x + (r - 1) * cos);
+          const rPrevY = Math.round(currentCenter.y + (r - 1) * sin);
+
+          if (rNextX < 0 || rNextX >= width || rNextY < 0 || rNextY >= height ||
+              rPrevX < 0 || rPrevX >= width || rPrevY < 0 || rPrevY >= height) continue;
+
+          const grad = data[rNextY * width + rNextX] - data[rPrevY * width + rPrevX];
+          if (grad < bestInnerGrad) {
             bestInnerGrad = grad;
             bestInnerR = r;
           }
+          // If we found a strong enough negative gradient close to the outer edge, stop.
+          // This helps avoid picking up inner shadows/circles as the annulus edge.
+          if (grad < -30 && r > bestR * 0.8) break;
         }
         if (bestInnerR) innerPoints.push({ r: bestInnerR });
       }
@@ -1167,28 +1214,101 @@ function detectAnnulusIterative(data, width, height, median, initialCenter, opts
 
     if (outerPoints.length < 8) break;
 
-    // Filter outliers using median radius
-    outerPoints.sort((a,b) => a.r - b.r);
-    const medR = outerPoints[Math.floor(outerPoints.length / 2)].r;
-    const filteredPoints = outerPoints.filter(p => Math.abs(p.r - medR) < medR * 0.1);
+    // Filter outliers based on distance from the FITTED circle of the PREVIOUS iteration (or initial radius)
+    // This is more robust than just filtering by radial distance from current center if the center is biased.
+    // However, on first iteration we have no choice.
+    const filteredPoints = outerPoints.filter(p => {
+       const dx = p.x - currentCenter.x;
+       const dy = p.y - currentCenter.y;
+       const d = Math.sqrt(dx*dx + dy*dy);
+       return Math.abs(d - outerRadius) < Math.max(30, outerRadius * 0.15);
+    });
 
-    if (filteredPoints.length < 8) break;
-
-    // Simple algebraic circle fit logic (Kåsa fit) to refine center
-    // For large circles, we can just average the points if they are well distributed,
-    // but a proper fit is better.
-    let sumX = 0, sumY = 0, sumR = 0;
-    for (const p of filteredPoints) {
-      sumX += p.x;
-      sumY += p.y;
-      sumR += p.r;
+    if (debug) {
+      // console.log(`Iter ${iter}: center=(${currentCenter.x.toFixed(2)}, ${currentCenter.y.toFixed(2)}) radius=${outerRadius.toFixed(2)} points=${filteredPoints.length}/${outerPoints.length}`);
     }
-    const newCenter = { x: sumX / filteredPoints.length, y: sumY / filteredPoints.length };
-    const newOuterRadius = sumR / filteredPoints.length;
+
+    // algebraic circle fit
+    // We want to minimize sum(( (x-xc)^2 + (y-yc)^2 - R^2 )^2)
+    // Actually, for consistency and simplicity, let's just use the median R and mean center if distributed well.
+    // But since it's failing, let's try a very robust approach: 
+    // 1. Keep center fixed if drift is small, or only move it slightly.
+    // 2. Use a better outlier rejection.
+
+    // Algebraic circle fit (Kåsa's method)
+    // Minimizes sum(( (x-xc)^2 + (y-yc)^2 - R^2 )^2)
+    // Linear system: A * [xc, yc, (xc^2 + yc^2 - R^2)]' = B
+    // Where A_i = [2*xi, 2*yi, -1], B_i = xi^2 + yi^2
+    const N = filteredPoints.length;
+    let sumXi = 0, sumYi = 0;
+    for (const p of filteredPoints) {
+      sumXi += p.x;
+      sumYi += p.y;
+    }
+
+    const meanX = sumXi / N;
+    const meanY = sumYi / N;
+
+    let Mxx = 0, Myy = 0, Mxy = 0, Mxz = 0, Myz = 0;
+    for (const p of filteredPoints) {
+      const dx = p.x - meanX;
+      const dy = p.y - meanY;
+      const dz = dx * dx + dy * dy;
+      Mxx += dx * dx;
+      Myy += dy * dy;
+      Mxy += dx * dy;
+      Mxz += dx * dz;
+      Myz += dy * dz;
+    }
+
+    const det = Mxx * Myy - Mxy * Mxy;
+    let newCenter;
+    if (Math.abs(det) > 1e-6) {
+      const xc_rel = (Mxz * Myy - Myz * Mxy) / (2 * det);
+      const yc_rel = (Myz * Mxx - Mxz * Mxy) / (2 * det);
+      newCenter = { x: meanX + xc_rel, y: meanY + yc_rel };
+    } else {
+      newCenter = { x: meanX, y: meanY };
+    }
+
+    // Robustness check: if new center is very far from current center, it might be due to 
+    // points being clustered on one side.
+    const distToInitial = Math.sqrt((newCenter.x - initialCenter.x)**2 + (newCenter.y - initialCenter.y)**2);
+    if (distToInitial > 150) { // arbitrary sanity check
+       if (debug) console.log(`  Warning: Circle fit center too far (${distToInitial.toFixed(1)}px); using mean instead`);
+       newCenter = { x: meanX, y: meanY };
+    }
+
+    // Limit center move to avoid divergence and add damping
+    const maxMove = 10;
+    const damping = 0.5; 
+    let dx = newCenter.x - currentCenter.x;
+    let dy = newCenter.y - currentCenter.y;
+    const moveDist = Math.sqrt(dx * dx + dy * dy);
+    
+    if (moveDist > maxMove) {
+       dx *= maxMove / moveDist;
+       dy *= maxMove / moveDist;
+    }
+    
+    newCenter.x = currentCenter.x + dx * damping;
+    newCenter.y = currentCenter.y + dy * damping;
+
+    let sumDists = 0;
+    for (const p of filteredPoints) {
+      const pdx = p.x - newCenter.x;
+      const pdy = p.y - newCenter.y;
+      sumDists += Math.sqrt(pdx * pdx + pdy * pdy);
+    }
+    const newOuterRadius = sumDists / filteredPoints.length;
+
+    // Filter outliers using median radius
+    innerPoints.sort((a,b) => a.r - b.r);
+    const medInnerR = innerPoints.length > 0 ? innerPoints[Math.floor(innerPoints.length / 2)].r : outerRadius * (expectedInnerDiameterPx / expectedOuterDiameterPx);
+    const filteredInnerPoints = innerPoints.filter(p => Math.abs(p.r - medInnerR) < Math.max(20, medInnerR * 0.1));
 
     // Inner radius logic
-    innerPoints.sort((a,b) => a.r - b.r);
-    const newInnerRadius = innerPoints.length > 4 ? innerPoints[Math.floor(innerPoints.length / 2)].r : newOuterRadius * 0.9;
+    const newInnerRadius = filteredInnerPoints.length > 4 ? filteredInnerPoints.reduce((s, p) => s + p.r, 0) / filteredInnerPoints.length : outerRadius * (expectedInnerDiameterPx / expectedOuterDiameterPx);
 
     // Update state for next iteration
     if (Math.abs(newCenter.x - currentCenter.x) < 1 && Math.abs(newCenter.y - currentCenter.y) < 1) {

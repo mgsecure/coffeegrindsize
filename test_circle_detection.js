@@ -2,7 +2,7 @@ import sharp from 'sharp';
 import fs from 'fs';
 
 async function test() {
-  const buffer = fs.readFileSync('WebApplication/client/src/resources/circle-93mm.jpeg');
+  const buffer = fs.readFileSync('WebApplication/client/src/resources/circle-93mm.jpg');
   const image = sharp(buffer);
   const metadata = await image.metadata();
   const { width, height } = metadata;

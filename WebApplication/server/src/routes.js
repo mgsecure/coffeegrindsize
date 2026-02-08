@@ -2,6 +2,14 @@ import formidable from 'formidable';
 import fs from 'fs';
 import { analyzeImage } from './util/analysis.js';
 import { logger } from './logger/logger.js';
+import path from 'path';
+import {fileURLToPath} from 'url'
+import dayjs from 'dayjs'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+console.log(__dirname)
+const resultsCacheDir = path.resolve(__dirname, 'resultsCache')
 
 export function registerRoutes(app, { prefix }) {
   app.get(`${prefix}/ready`, (req, res) => {
@@ -28,6 +36,8 @@ export function registerRoutes(app, { prefix }) {
         // Log file information for debugging (support formidable variations)
         const resolvedPath = file.filepath || file.path || file.fileName || null;
         logger.info({ file: { name: file.originalFilename || file.name || null, size: file.size || null, resolvedPath } }, 'Received uploaded file');
+        const uploadFileName = file.originalFilename || file.name || null;
+
         let buffer = null;
         // If formidable provided a path on disk, read it
         const candidatePath = resolvedPath || file.filepath || file.path;
@@ -61,15 +71,20 @@ export function registerRoutes(app, { prefix }) {
           return;
         }
 
+        const getField = (f) => Array.isArray(f) ? f[0] : f;
         const options = {
-          threshold: fields.threshold ? parseFloat(fields.threshold) : 58.8,
-          maxClusterAxis: fields.maxClusterAxis ? parseFloat(fields.maxClusterAxis) : 5,
-          minSurface: fields.minSurface ? parseFloat(fields.minSurface) : 0.05,
-          maxSurface: fields.maxSurface ? parseFloat(fields.maxSurface) : 10,
-          minRoundness: fields.minRoundness ? parseFloat(fields.minRoundness) : 0,
-          referenceThreshold: fields.referenceThreshold ? parseFloat(fields.referenceThreshold) : 0.4,
-          maxCost: fields.maxCost ? parseFloat(fields.maxCost) : 0.35,
-          quick: fields.quick === 'true' || fields.quick === true || fields.quick?.[0] === 'true',
+          threshold: fields.threshold ? parseFloat(getField(fields.threshold)) : 58.8,
+          brightness: fields.brightness ? parseFloat(getField(fields.brightness)) : 1.0,
+          contrast: fields.contrast ? parseFloat(getField(fields.contrast)) : 1.0,
+          maxClusterAxis: fields.maxClusterAxis ? parseFloat(getField(fields.maxClusterAxis)) : 5,
+          minSurface: fields.minSurface ? parseFloat(getField(fields.minSurface)) : 0.05,
+          maxSurface: fields.maxSurface ? parseFloat(getField(fields.maxSurface)) : 10,
+          minRoundness: fields.minRoundness ? parseFloat(getField(fields.minRoundness)) : 0,
+          referenceThreshold: fields.referenceThreshold ? parseFloat(getField(fields.referenceThreshold)) : 0.4,
+          maxCost: fields.maxCost ? parseFloat(getField(fields.maxCost)) : 0.35,
+          quick: getField(fields.quick) === 'true' || getField(fields.quick) === true,
+          referenceMode: getField(fields.referenceMode) || 'detected',
+          debug: getField(fields.debug) === 'true' || getField(fields.debug) === true
         };
 
         logger.info({ options }, 'Analyze options');
@@ -87,8 +102,21 @@ export function registerRoutes(app, { prefix }) {
            return;
          }
 
+        const outputFilename = `${uploadFileName}_${dayjs().format( 'YYYYMMDD_HHmmss')}`;
+        if (!fs.existsSync(resultsCacheDir)) {
+          fs.mkdirSync(resultsCacheDir, { recursive: true });
+        }
+        const resultsCopy = { ...results }
+        delete resultsCopy.thresholdImage
+        delete resultsCopy.outlinesImage
+
+        fs.writeFileSync(path.join(resultsCacheDir, `${outputFilename}_results.json`), JSON.stringify(resultsCopy, null, 2), 'utf8')
+
         res.json(results);
-       } catch (error) {
+
+
+
+      } catch (error) {
          logger.error({ error: error.message, stack: error.stack }, 'Error during analysis');
          res.status(500).json({ error: 'Error during analysis', message: error.message });
        }

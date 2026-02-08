@@ -51,3 +51,4 @@ server/keys
 App/dist/.DS_Store
 /WebApplication/tmp
 App/dist/.DS_Store
+/WebApplication/server/src/resultsCache
