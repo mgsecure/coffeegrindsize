@@ -472,54 +472,67 @@ export async function analyzeImage(buffer, options = {}) {
       .toBuffer()
       .then(b => b.toString('base64'));
 
-    // Compute summary statistics (D10/D50/D90, mode, mean, stdDev) on particle diameters (mm)
+    // Compute summary statistics (D10/D50/D90, mode, mean, stdDev) on particle diameters (mm) and surfaces (mm2)
     let statistics = null;
     if (clusters.length > 0) {
-      const diameters = clusters.map(p => p.diameterMm).filter(d => Number.isFinite(d)).sort((a,b)=>a-b);
-      const n = diameters.length;
+      const computeStats = (vals) => {
+        const sorted = vals.filter(v => Number.isFinite(v)).sort((a, b) => a - b);
+        const n = sorted.length;
+        if (n === 0) return null;
 
-      const quantile = (arr, q) => {
-        if (arr.length === 0) return 0;
-        const pos = (arr.length - 1) * q;
-        const lower = Math.floor(pos);
-        const upper = Math.ceil(pos);
-        if (lower === upper) return arr[lower];
-        const weight = pos - lower;
-        return arr[lower] * (1 - weight) + arr[upper] * weight;
+        const quantile = (arr, q) => {
+          const pos = (arr.length - 1) * q;
+          const lower = Math.floor(pos);
+          const upper = Math.ceil(pos);
+          if (lower === upper) return arr[lower];
+          const weight = pos - lower;
+          return arr[lower] * (1 - weight) + arr[upper] * weight;
+        };
+
+        const q10 = quantile(sorted, 0.10);
+        const q50 = quantile(sorted, 0.50);
+        const q90 = quantile(sorted, 0.90);
+
+        const mean = sorted.reduce((s, v) => s + v, 0) / n;
+        const variance = n > 1 ? sorted.reduce((s, v) => s + (v - mean) ** 2, 0) / (n - 1) : 0;
+        const stdDev = Math.sqrt(variance);
+
+        const bins = Math.min(100, Math.max(10, Math.round(Math.sqrt(n))));
+        const minVal = sorted[0];
+        const maxVal = sorted[sorted.length - 1];
+        const binCounts = new Array(bins).fill(0);
+        const binWidth = (maxVal - minVal) / bins || 1;
+        for (const v of sorted) {
+          const idx = Math.min(bins - 1, Math.floor((v - minVal) / binWidth));
+          binCounts[idx]++;
+        }
+        let maxIdx = 0;
+        for (let i = 1; i < bins; i++) if (binCounts[i] > binCounts[maxIdx]) maxIdx = i;
+        const mode = minVal + (maxIdx + 0.5) * binWidth;
+
+        return {
+          mean,
+          stdDev,
+          mode,
+          p10: q10,
+          p50: q50,
+          p90: q90,
+          // Legacy aliases for diameter
+          D10: q10,
+          D50: q50,
+          D90: q90
+        };
       };
 
-      const D10 = quantile(diameters, 0.10);
-      const D50 = quantile(diameters, 0.50);
-      const D90 = quantile(diameters, 0.90);
-
-      // Mean
-      const mean = diameters.reduce((s, v) => s + v, 0) / n;
-      // Sample standard deviation (n>1)
-      const variance = n > 1 ? diameters.reduce((s, v) => s + (v - mean) ** 2, 0) / (n - 1) : 0;
-      const stdDev = Math.sqrt(variance);
-
-      // Mode via histogram (100 bins or fewer if small sample)
-      const bins = Math.min(100, Math.max(10, Math.round(Math.sqrt(n))));
-      const minD = diameters[0];
-      const maxD = diameters[diameters.length -1];
-      const binCounts = new Array(bins).fill(0);
-      const binWidth = (maxD - minD) / bins || 1;
-      for (const d of diameters) {
-        const idx = Math.min(bins - 1, Math.floor((d - minD) / binWidth));
-        binCounts[idx]++;
-      }
-      let maxIdx = 0;
-      for (let i=1;i<bins;i++) if (binCounts[i] > binCounts[maxIdx]) maxIdx = i;
-      const mode = minD + (maxIdx + 0.5) * binWidth;
+      const diameterStats = computeStats(clusters.map(p => p.diameterMm));
+      const surfaceStats = computeStats(clusters.map(p => p.surfaceMm2));
 
       statistics = {
-        count: n,
-        mean,
-        stdDev,
-        mode,
-        D10,
-        D50,
-        D90,
+        count: clusters.length,
+        diameter: diameterStats,
+        surface: surfaceStats,
+        // Legacy flat structure for backward compatibility
+        ...diameterStats
       };
     }
 
