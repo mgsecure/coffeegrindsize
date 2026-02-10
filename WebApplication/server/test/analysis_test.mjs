@@ -13,6 +13,8 @@ function approxEqual(a, b, tol) {
 }
 
 async function run() {
+  const start = Date.now()
+
   const tests = [
     // Standard test with 'detected' mode (actual pixel scale for this specific file is ~16.84)
     //{ rel: `${resourcesDir}/circle-93mm.jpg`, mode: 'detected', expectScale: 16.84, tol: 0.1, minParticles: 200 },
@@ -20,8 +22,9 @@ async function run() {
     //{ rel: `${resourcesDir}/circle-93mm.jpg`, mode: 'fixed', expectScale: 18.624, tol: 0.01, minParticles: 200 },
     //{ rel: `${resourcesDir}/circle-93mm-crop.jpg`, mode: 'detected', expectScale: 16.82, tol: 0.1, minParticles: 200 },
     //{ rel: `${resourcesDir}/circle-93mm-crop-72ppcm.jpg`, mode: 'detected', expectScale: 12.08, tol: 0.1, minParticles: 200 }
-    { rel: `${resourcesDir}/4-drop-flash-contrast.jpg`, mode: 'detected', expectScale: 12.82, tol: 0.1, minParticles: 200 },
-    { rel: `${resourcesDir}/4-drop-flash.jpeg`, mode: 'detected', expectScale: 12.82, tol: 0.1, minParticles: 200, options: { contrast: 1.5 } }
+    //{ rel: `${resourcesDir}/4-drop-flash-contrast.jpg`, mode: 'detected', expectScale: 12.82, tol: 0.1, minParticles: 200 },
+    //{ rel: `${resourcesDir}/4-drop-flash.jpeg`, mode: 'detected', expectScale: 12.82, tol: 0.1, minParticles: 200, options: { contrast: 1.5 } },
+    { rel: `${resourcesDir}/M47-1.0.0-closer-ps.png`, mode: 'detected', expectScale: 13.59, tol: 0.1, minParticles: 200 },
   ];
 
   for (const t of tests) {
@@ -55,6 +58,7 @@ async function run() {
       throw new Error(`particleCount ${res.particleCount} < min ${t.minParticles} for ${p}`);
     }
     console.log('PASS');
+    console.log('Done', res.particleCount, 'particles, time:', Date.now() - start, 'ms')
   }
 }
 

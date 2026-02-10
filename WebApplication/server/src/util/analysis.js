@@ -106,6 +106,11 @@ export async function analyzeImage(buffer, options = {}) {
       referenceMode = 'detected',
     } = options;
 
+    const useQuick = quick === true || quick === 'true' || quick === 1 || quick === '1';
+    const useDebug = debug === true || debug === 'true' || debug === 1 || debug === '1';
+
+    logger.info({ threshold, quick: useQuick, maxClusterAxis, minSurface, maxSurface, minRoundness, referenceMode, brightness, contrast, debug: useDebug }, 'analyzeImage options in effect');
+
     // 1. Load image and get blue channel
     let image = sharp(buffer);
 
@@ -156,7 +161,7 @@ export async function analyzeImage(buffer, options = {}) {
       expectedInnerDiameterPx,
       minDetectedOuterFraction,
       minOuterImgFraction,
-      debug
+      debug: useDebug
     });
 
     if (circleInfo) {
@@ -167,7 +172,7 @@ export async function analyzeImage(buffer, options = {}) {
     // If detectAnnulusIterative failed, try remaining fallbacks.
     if (!circleInfo) {
       const preferCenter = boxCircle ? boxCircle.center : null;
-      const radial = detectAnnulusByRadialProfile(data, width, height, medianInitial, preferCenter, { expectedOuterDiameterPx, minDetectedOuterFraction, minOuterImgFraction });
+      const radial = detectAnnulusByRadialProfile(data, width, height, medianInitial, preferCenter, { expectedOuterDiameterPx, minDetectedOuterFraction, minOuterImgFraction, debug: useDebug });
       if (radial) {
         circleInfo = radial;
         detectorUsed = 'radial';
@@ -181,7 +186,7 @@ export async function analyzeImage(buffer, options = {}) {
       const minByImage = Math.min(width, height) * minOuterImgFraction;
       const minAllowed = Math.max(1, Math.round(Math.max(minByExpected, minByImage)));
       if (circleInfo.diameterPixels < minAllowed) {
-        const avg = detectAnnulusByRadialProfileAvg(data, width, height, medianInitial, circleInfo.center || (boxCircle && boxCircle.center) || null, { expectedOuterDiameterPx, minDetectedOuterFraction, minOuterImgFraction });
+        const avg = detectAnnulusByRadialProfileAvg(data, width, height, medianInitial, circleInfo.center || (boxCircle && boxCircle.center) || null, { expectedOuterDiameterPx, minDetectedOuterFraction, minOuterImgFraction, debug: useDebug });
         if (avg && avg.diameterPixels >= minAllowed) {
           logger.info({ measuredOuterPx: circleInfo.diameterPixels, fallbackOuterPx: avg.diameterPixels, minAllowed }, 'Radial-average fallback found a larger annulus and will be used');
           circleInfo = avg;
@@ -341,33 +346,13 @@ export async function analyzeImage(buffer, options = {}) {
     const visited = new Uint8Array(data.length);
     const clusters = [];
 
-    const thresholdImageBuffer = new Uint8Array(width * height * 3);
-    const outlinesImageBuffer = new Uint8Array(width * height * 3);
-
-    for (let i = 0; i < data.length; i++) {
-      thresholdImageBuffer[i * 3] = data[i];
-      thresholdImageBuffer[i * 3 + 1] = data[i];
-      thresholdImageBuffer[i * 3 + 2] = data[i];
-
-      outlinesImageBuffer[i * 3] = data[i];
-      outlinesImageBuffer[i * 3 + 1] = data[i];
-      outlinesImageBuffer[i * 3 + 2] = data[i];
-    }
-
-    for (const index of thresholdedIndices) {
-      thresholdImageBuffer[index * 3] = 255;
-      thresholdImageBuffer[index * 3 + 1] = 0;
-      thresholdImageBuffer[index * 3 + 2] = 0;
-    }
-
-    // Sort thresholded indices by brightness to match Python (darkest first)
-    thresholdedIndices.sort((a, b) => data[a] - data[b]);
-
     // Apply a simple noise filter: remove isolated thresholded pixels
+    // Use the raw mask directly to avoid extra sortedIndices pass if not needed yet
     const denoisedMask = new Uint8Array(mask.length);
-    for (const idx of thresholdedIndices) {
+    for (let i = 0; i < thresholdedIndices.length; i++) {
+      const idx = thresholdedIndices[i];
       const x = idx % width;
-      const y = Math.floor(idx / width);
+      const y = (idx / width) | 0;
       let neighborsCount = 0;
       if (x > 0 && mask[idx - 1]) neighborsCount++;
       if (x < width - 1 && mask[idx + 1]) neighborsCount++;
@@ -378,50 +363,99 @@ export async function analyzeImage(buffer, options = {}) {
       }
     }
 
-    for (const index of thresholdedIndices) {
-      if (!denoisedMask[index] || visited[index]) continue;
+    // Counting sort thresholded indices by brightness (0-255) to match Python (darkest first)
+    // Only sort the DENOISED thresholded pixels to reduce work
+    const denoisedThresholdedIndices = [];
+    for (let i = 0; i < thresholdedIndices.length; i++) {
+      if (denoisedMask[thresholdedIndices[i]]) {
+        denoisedThresholdedIndices.push(thresholdedIndices[i]);
+      }
+    }
+
+    const counts = new Uint32Array(256);
+    for (let i = 0; i < denoisedThresholdedIndices.length; i++) {
+      counts[data[denoisedThresholdedIndices[i]]]++;
+    }
+    const offsets = new Uint32Array(256);
+    for (let i = 1; i < 256; i++) {
+      offsets[i] = offsets[i - 1] + counts[i - 1];
+    }
+    const sortedIndices = new Uint32Array(denoisedThresholdedIndices.length);
+    for (let i = 0; i < denoisedThresholdedIndices.length; i++) {
+      const idx = denoisedThresholdedIndices[i];
+      sortedIndices[offsets[data[idx]]++] = idx;
+    }
+
+    for (let i = 0; i < sortedIndices.length; i++) {
+      const index = sortedIndices[i];
+      if (visited[index]) continue;
 
       let cluster = [];
       let queue = [index];
+      let head = 0;
       visited[index] = 1;
       let isOnEdge = false;
 
-      // Use a Set for fast checking of current cluster members if needed
-      // But BFS naturally handles connection.
-      // The "cost" logic in Python is a bit more than just BFS.
-      // It's a "clump breakup" step.
+      const sX = index % width;
+      const sY = (index / width) | 0;
 
-      while (queue.length > 0) {
-        const curr = queue.shift();
+      // Segmentation BFS
+      while (head < queue.length) {
+        const curr = queue[head++];
         cluster.push(curr);
         if (edgePixels.has(curr)) isOnEdge = true;
 
         const x = curr % width;
-        const y = Math.floor(curr / width);
+        const y = (curr / width) | 0;
 
-        const neighbors = [
-          [x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]
-        ];
-
-        for (const [nx, ny] of neighbors) {
-          if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-            const nIdx = ny * width + nx;
-            if (denoisedMask[nIdx] && !visited[nIdx]) {
-              // Distance check to avoid huge clusters early if we want to match Python's max_cluster_axis
-              const nx_val = nIdx % width;
-              const ny_val = Math.floor(nIdx / width);
-              const start_x = index % width;
-              const start_y = Math.floor(index / width);
-              if ((nx_val - start_x) ** 2 + (ny_val - start_y) ** 2 <= maxClusterAxisPx ** 2) {
-                visited[nIdx] = 1;
-                queue.push(nIdx);
-              }
+        // Inline 4-neighbors check
+        if (x + 1 < width) {
+          const nIdx = curr + 1;
+          if (denoisedMask[nIdx] && !visited[nIdx]) {
+            const dx = (x + 1) - sX;
+            const dy = y - sY;
+            if (dx * dx + dy * dy <= maxClusterAxisPx ** 2) {
+              visited[nIdx] = 1;
+              queue.push(nIdx);
+            }
+          }
+        }
+        if (x - 1 >= 0) {
+          const nIdx = curr - 1;
+          if (denoisedMask[nIdx] && !visited[nIdx]) {
+            const dx = (x - 1) - sX;
+            const dy = y - sY;
+            if (dx * dx + dy * dy <= maxClusterAxisPx ** 2) {
+              visited[nIdx] = 1;
+              queue.push(nIdx);
+            }
+          }
+        }
+        if (y + 1 < height) {
+          const nIdx = curr + width;
+          if (denoisedMask[nIdx] && !visited[nIdx]) {
+            const dx = x - sX;
+            const dy = (y + 1) - sY;
+            if (dx * dx + dy * dy <= maxClusterAxisPx ** 2) {
+              visited[nIdx] = 1;
+              queue.push(nIdx);
+            }
+          }
+        }
+        if (y - 1 >= 0) {
+          const nIdx = curr - width;
+          if (denoisedMask[nIdx] && !visited[nIdx]) {
+            const dx = x - sX;
+            const dy = (y - 1) - sY;
+            if (dx * dx + dy * dy <= maxClusterAxisPx ** 2) {
+              visited[nIdx] = 1;
+              queue.push(nIdx);
             }
           }
         }
       }
 
-      if (!quick && cluster.length > 1) {
+      if (!useQuick && cluster.length > 1) {
         cluster = breakClump(cluster, index, data, width, height, median, { ...options, maxClusterAxisPx });
 
         // If we broke up a clump, we MUST re-verify if the new smaller cluster still touches the edge.
@@ -448,13 +482,39 @@ export async function analyzeImage(buffer, options = {}) {
             metrics.surfacePx >= minSurfacePx &&
             metrics.surfacePx <= maxSurfacePx &&
             metrics.roundness >= minRoundness) {
-          clusters.push(metrics);
-          drawOutline(outlinesImageBuffer, cluster, width, height);
+          clusters.push({ ...metrics, pixels: cluster });
         }
       }
     }
 
     // Draw circle detection for feedback
+    const thresholdImageBuffer = new Uint8Array(width * height * 3);
+    const outlinesImageBuffer = new Uint8Array(width * height * 3);
+
+    for (let i = 0; i < data.length; i++) {
+      const val = data[i];
+      const i3 = i * 3;
+      thresholdImageBuffer[i3] = val;
+      thresholdImageBuffer[i3 + 1] = val;
+      thresholdImageBuffer[i3 + 2] = val;
+      outlinesImageBuffer[i3] = val;
+      outlinesImageBuffer[i3 + 1] = val;
+      outlinesImageBuffer[i3 + 2] = val;
+    }
+
+    // Mark ALL thresholded pixels red in threshold image at once
+    for (let i = 0; i < thresholdedIndices.length; i++) {
+      const i3 = thresholdedIndices[i] * 3;
+      thresholdImageBuffer[i3] = 255;
+      thresholdImageBuffer[i3 + 1] = 0;
+      thresholdImageBuffer[i3 + 2] = 0;
+    }
+
+    // Draw outlines for valid clusters
+    for (let i = 0; i < clusters.length; i++) {
+      drawOutline(outlinesImageBuffer, clusters[i].pixels, width, height);
+    }
+
     if (circleCenter && outerRadius != null && innerRadius != null) {
       // Outer circle (blue)
       drawCircle(outlinesImageBuffer, circleCenter, outerRadius, width, height, [0, 0, 255]);
@@ -557,7 +617,7 @@ export async function analyzeImage(buffer, options = {}) {
         edgeTolerancePx,
         referenceMode,
       },
-      debug: debug ? {
+      debug: useDebug ? {
         totalThresholded,
         thresholdedInsideInner,
         analysisRegion,
@@ -569,13 +629,11 @@ export async function analyzeImage(buffer, options = {}) {
         detectorUsed: usedDetector,
         detectorDetail: usedDetectorDetail,
         center: circleCenter,
-        houghRaw: (typeof usedDetectorDetail === 'string' && usedDetectorDetail.startsWith('hough')) ? (circleInfo && circleInfo.raw ? circleInfo.raw : undefined) : undefined,
-        houghInputFile: (typeof usedDetectorDetail === 'string' && usedDetectorDetail.startsWith('hough')) ? (circleInfo && circleInfo.inputFile ? circleInfo.inputFile : undefined) : undefined,
        } : undefined,
     };
 
     // If debug is enabled, write a debug JSON to /tmp so the runner can pick it up even if stdout is suppressed
-    if (debug) {
+    if (useDebug) {
       try {
         const fs = await import('fs');
         const path = `/tmp/analysis_debug_${Date.now()}.json`;
@@ -584,7 +642,6 @@ export async function analyzeImage(buffer, options = {}) {
         // ignore file write errors
       }
     }
-
     return result;
   } catch (err) {
     // Log internal errors with stack for server-side troubleshooting and rethrow
@@ -619,11 +676,12 @@ function detectReferenceCircle(data, width, height, median) {
     if (data[i] < circleThreshold && !visited[i]) {
       const cluster = [];
       const queue = [i];
+      let head = 0;
       visited[i] = 1;
       let minX = i % width, maxX = i % width, minY = Math.floor(i / width), maxY = Math.floor(i / width);
 
-      while (queue.length > 0) {
-        const curr = queue.shift();
+      while (head < queue.length) {
+        const curr = queue[head++];
         cluster.push(curr);
         const x = curr % width;
         const y = Math.floor(curr / width);
@@ -946,25 +1004,46 @@ function drawLine(buffer, x1, y1, x2, y2, width, height, color) {
 }
 
 function drawOutline(buffer, cluster, width, height) {
-  const clusterSet = new Set(cluster);
+  // Use a local bitmask for the cluster to avoid creating a Set
+  // Find cluster bounding box
+  let minX = width, minY = height, maxX = 0, maxY = 0;
+  for (const idx of cluster) {
+    const x = idx % width;
+    const y = Math.floor(idx / width);
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  const w = maxX - minX + 1;
+  const h = maxY - minY + 1;
+  const clusterMask = new Uint8Array(w * h);
+  for (const idx of cluster) {
+    clusterMask[(Math.floor(idx / width) - minY) * w + (idx % width - minX)] = 1;
+  }
+
   for (const idx of cluster) {
     const x = idx % width;
     const y = Math.floor(idx / width);
 
-    // Check if it's an edge pixel of the cluster
     let isEdge = false;
-    const neighbors = [[x+1, y], [x-1, y], [x, y+1], [x, y-1]];
-    for (const [nx, ny] of neighbors) {
-      if (nx < 0 || nx >= width || ny < 0 || ny >= height || !clusterSet.has(ny * width + nx)) {
+    const nxCoords = [x + 1, x - 1, x, x];
+    const nyCoords = [y, y, y + 1, y - 1];
+
+    for (let i = 0; i < 4; i++) {
+      const nx = nxCoords[i];
+      const ny = nyCoords[i];
+      if (nx < minX || nx > maxX || ny < minY || ny > maxY || !clusterMask[(ny - minY) * w + (nx - minX)]) {
         isEdge = true;
         break;
       }
     }
 
     if (isEdge) {
-      buffer[idx * 3] = 0;
-      buffer[idx * 3 + 1] = 255;
-      buffer[idx * 3 + 2] = 0; // Green outline
+      const i3 = idx * 3;
+      buffer[i3] = 0;
+      buffer[i3 + 1] = 255;
+      buffer[i3 + 2] = 0;
     }
   }
 }
@@ -998,14 +1077,8 @@ function calculateMedian(data, region = null, width = 0) {
 
 
 function breakClump(cluster, seedIndex, data, width, height, median, opts = {}) {
-  // Conservative, dependency-free clump breaker:
-  // - Build a local binary mask for the cluster in its bounding box
-  // - Perform several iterations of pruning (remove pixels with <=1 neighbor) to try to thin bridges
-  // - Extract connected components; return the component that contains the original seedIndex
-  // If no split is found, return the original cluster.
   if (!cluster || cluster.length <= 1) return cluster;
 
-  // Compute bounding box
   let minX = width, minY = height, maxX = 0, maxY = 0;
   for (const idx of cluster) {
     const x = idx % width;
@@ -1016,7 +1089,6 @@ function breakClump(cluster, seedIndex, data, width, height, median, opts = {}) 
     if (y > maxY) maxY = y;
   }
 
-  // Pad bounding box by 1 to avoid edge issues
   minX = Math.max(0, minX - 1);
   minY = Math.max(0, minY - 1);
   maxX = Math.min(width - 1, maxX + 1);
@@ -1024,18 +1096,11 @@ function breakClump(cluster, seedIndex, data, width, height, median, opts = {}) 
   const wBox = maxX - minX + 1;
   const hBox = maxY - minY + 1;
 
-  // Map cluster indices into mask
   const mask = new Uint8Array(wBox * hBox);
-  const idxSet = new Set(cluster);
   for (const idx of cluster) {
-    const x = idx % width;
-    const y = Math.floor(idx / width);
-    const bx = x - minX;
-    const by = y - minY;
-    mask[by * wBox + bx] = 1;
+    mask[(Math.floor(idx / width) - minY) * wBox + (idx % width - minX)] = 1;
   }
 
-  // Iteratively prune endpoints: pixels with <= 1 neighbor (4-neighbors)
   const maxIter = 20;
   let changed = true;
   let iter = 0;
@@ -1044,8 +1109,9 @@ function breakClump(cluster, seedIndex, data, width, height, median, opts = {}) 
     iter++;
     const toRemove = [];
     for (let by = 0; by < hBox; by++) {
+      const rowOffset = by * wBox;
       for (let bx = 0; bx < wBox; bx++) {
-        const p = by * wBox + bx;
+        const p = rowOffset + bx;
         if (!mask[p]) continue;
         let neigh = 0;
         if (bx > 0 && mask[p - 1]) neigh++;
@@ -1056,91 +1122,75 @@ function breakClump(cluster, seedIndex, data, width, height, median, opts = {}) 
       }
     }
     if (toRemove.length === 0) break;
-    for (const p of toRemove) {
-      mask[p] = 0;
+    for (let i = 0; i < toRemove.length; i++) {
+      mask[toRemove[i]] = 0;
       changed = true;
     }
   }
 
-  // Find connected components in the pruned mask (4-connectivity)
   const visited = new Uint8Array(wBox * hBox);
   const components = [];
+  const seedBx = (seedIndex % width) - minX;
+  const seedBy = Math.floor(seedIndex / width) - minY;
+  const seedP = seedBy * wBox + seedBx;
+  let chosenComp = null;
+
   for (let by = 0; by < hBox; by++) {
+    const rowOffset = by * wBox;
     for (let bx = 0; bx < wBox; bx++) {
-      const p = by * wBox + bx;
+      const p = rowOffset + bx;
       if (!mask[p] || visited[p]) continue;
-      // BFS
+
       const comp = [];
       const q = [p];
+      let head = 0;
+      let hasSeed = false;
       visited[p] = 1;
-      while (q.length > 0) {
-        const cur = q.shift();
+
+      while (head < q.length) {
+        const cur = q[head++];
         comp.push(cur);
+        if (cur === seedP) hasSeed = true;
+
         const cx = cur % wBox;
         const cy = Math.floor(cur / wBox);
-        const neighbors = [];
-        if (cx > 0) neighbors.push(cur - 1);
-        if (cx < wBox - 1) neighbors.push(cur + 1);
-        if (cy > 0) neighbors.push(cur - wBox);
-        if (cy < hBox - 1) neighbors.push(cur + wBox);
-        for (const nb of neighbors) {
-          if (!visited[nb] && mask[nb]) {
-            visited[nb] = 1;
-            q.push(nb);
+        const neighbors = [cur - 1, cur + 1, cur - wBox, cur + wBox];
+        const nxCoords = [cx - 1, cx + 1, cx, cx];
+        const nyCoords = [cy, cy, cy - 1, cy + 1];
+
+        for (let i = 0; i < 4; i++) {
+          const nb = neighbors[i];
+          if (nxCoords[i] >= 0 && nxCoords[i] < wBox && nyCoords[i] >= 0 && nyCoords[i] < hBox) {
+            if (!visited[nb] && mask[nb]) {
+              visited[nb] = 1;
+              q.push(nb);
+            }
           }
         }
       }
+      if (hasSeed) chosenComp = comp;
       components.push(comp);
     }
   }
 
-  // If only one component, no split happened; return original cluster
   if (components.length <= 1) return cluster;
+  if (!chosenComp) chosenComp = components.sort((a, b) => b.length - a.length)[0];
 
-  // Filter components: only keep those with reasonable shape/size if we wanted to be aggressive
-  // but here we just want to break bridges. 
-
-  // Identify which component contains the seedIndex; map seedIndex into box coords
-  const seedX = seedIndex % width;
-  const seedY = Math.floor(seedIndex / width);
-  const seedBx = seedX - minX;
-  const seedBy = seedY - minY;
-  const seedP = seedBy * wBox + seedBx;
-
-  let chosenComp = null;
-  for (const comp of components) {
-    if (comp.includes(seedP)) { chosenComp = comp; break; }
-  }
-
-  if (!chosenComp) {
-    // fallback: pick the largest component
-    chosenComp = components.sort((a,b)=>b.length-a.length)[0];
-  }
-
-  // Map chosen component back to global indices
   const out = [];
-  for (const p of chosenComp) {
-    const bx = p % wBox;
-    const by = Math.floor(p / wBox);
-    const gx = bx + minX;
-    const gy = by + minY;
-    out.push(gy * width + gx);
+  for (let i = 0; i < chosenComp.length; i++) {
+    const p = chosenComp[i];
+    out.push((Math.floor(p / wBox) + minY) * width + (p % wBox + minX));
   }
-
-  // If the chosen piece is too small (less than half), return original cluster to be conservative
-  if (out.length < Math.max(1, Math.round(cluster.length * 0.25))) {
-    return cluster;
-  }
-  return out;
+  return out.length < Math.round(cluster.length * 0.25) ? cluster : out;
 }
 
 function detectAnnulusIterative(data, width, height, median, initialCenter, opts = {}) {
+  const { expectedOuterDiameterPx = 1744, expectedInnerDiameterPx = 1500, minDetectedOuterFraction = 0.6, minOuterImgFraction = 0.1, debug = false } = opts;
+  const useDebug = debug === true || debug === 'true' || debug === 1 || debug === '1';
   // Pure JS iterative radial detector for identifying the annulus.
   // 1. Samples rays from center to find edge points via gradient.
   // 2. Fits a circle to those points to refine center and radius.
   // 3. Repeats to converge.
-
-  const { expectedOuterDiameterPx = 1744, expectedInnerDiameterPx = 1500, minDetectedOuterFraction = 0.6, debug = false } = opts;
   const expectedRadius = expectedOuterDiameterPx / 2;
   const minRadius = expectedRadius * minDetectedOuterFraction;
   const circleThreshold = (median * 40) / 100;
@@ -1237,7 +1287,7 @@ function detectAnnulusIterative(data, width, height, median, initialCenter, opts
        return Math.abs(d - outerRadius) < Math.max(30, outerRadius * 0.15);
     });
 
-    if (debug) {
+    if (useDebug) {
       // console.log(`Iter ${iter}: center=(${currentCenter.x.toFixed(2)}, ${currentCenter.y.toFixed(2)}) radius=${outerRadius.toFixed(2)} points=${filteredPoints.length}/${outerPoints.length}`);
     }
 

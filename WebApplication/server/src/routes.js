@@ -17,7 +17,13 @@ export function registerRoutes(app, { prefix }) {
   })
 
   app.post(`${prefix}/analyze`, (req, res) => {
-    const form = formidable({});
+
+    const start = Date.now()
+
+    const form = formidable({
+      maxFileSize: 50 * 1024 * 1024, // 50MB
+      multiples: true
+    });
 
     form.parse(req, async (err, fields, files) => {
       if (err) {
@@ -82,9 +88,9 @@ export function registerRoutes(app, { prefix }) {
           minRoundness: fields.minRoundness ? parseFloat(getField(fields.minRoundness)) : 0,
           referenceThreshold: fields.referenceThreshold ? parseFloat(getField(fields.referenceThreshold)) : 0.4,
           maxCost: fields.maxCost ? parseFloat(getField(fields.maxCost)) : 0.35,
-          quick: getField(fields.quick) === 'true' || getField(fields.quick) === true,
+          quick: getField(fields.quick) === 'true' || getField(fields.quick) === true || getField(fields.quick) === '1' || getField(fields.quick) === 1,
           referenceMode: getField(fields.referenceMode) || 'detected',
-          debug: getField(fields.debug) === 'true' || getField(fields.debug) === true
+          debug: getField(fields.debug) === 'true' || getField(fields.debug) === true || getField(fields.debug) === '1' || getField(fields.debug) === 1
         };
 
         logger.info({ options }, 'Analyze options');
@@ -110,7 +116,9 @@ export function registerRoutes(app, { prefix }) {
         delete resultsCopy.thresholdImage
         delete resultsCopy.outlinesImage
 
-        fs.writeFileSync(path.join(resultsCacheDir, `${outputFilename}_results.json`), JSON.stringify(resultsCopy, null, 2), 'utf8')
+        //fs.writeFileSync(path.join(resultsCacheDir, `${outputFilename}_results.json`), JSON.stringify(resultsCopy, null, 2), 'utf8')
+
+        logger.info(['Done', results.particleCount, 'particles, time:', Date.now() - start, 'ms'].join(' '))
 
         res.json(results);
 

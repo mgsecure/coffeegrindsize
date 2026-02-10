@@ -6,7 +6,7 @@ import {
     ToggleButton, ToggleButtonGroup
 } from '@mui/material'
 import axios from 'axios'
-import Histogram from './Histogram.jsx'
+import HistogramSelect from './HistogramSelect.jsx'
 import ExportButton from './ExportButton.jsx'
 import Dropzone from './formUtils/Dropzone.jsx'
 import useWindowSize from './util/useWindowSize.jsx'
@@ -14,10 +14,9 @@ import ContentDrawerButton from './misc/ContentDrawerButton.jsx'
 
 function App() {
     const [droppedFiles, setDroppedFiles] = useState([])
-    const [selectedFile, setSelectedFile] = useState(null)
-    const [previewUrl, setPreviewUrl] = useState(null)
-    const [results, setResults] = useState(null)
-    const [terseResults, setTerseResults] = useState(null)
+    const [results, setResults] = useState([]) // Array of results for each file
+    const [selectedResultIndices, setSelectedResultIndices] = useState([])
+    const [viewMode, setViewMode] = useState('single') // 'single', 'comparison', 'aggregate'
     const [loading, setLoading] = useState(false)
     const [error, setError] = useState(null)
 
@@ -39,140 +38,166 @@ function App() {
     const [displayType, setDisplayType] = useState('original') // original, thresholded, outlines
     const [yAxisMetric, setYAxisMetric] = useState('mass') // 'mass' | 'count'
 
-    const handleFileChange = (event) => {
-        const file = event.target.files[0]
-        if (file) {
-            setSelectedFile(file)
-            setPreviewUrl(URL.createObjectURL(file))
-            setDisplayType('original')
-            setResults(null)
-        }
-    }
-
     const handleDroppedFiles = useCallback((allFiles) => {
         if (allFiles && allFiles.length > 0) {
             setDroppedFiles(allFiles)
-            setSelectedFile(allFiles[0])
-            setPreviewUrl(URL.createObjectURL(allFiles[0]))
         } else {
             setDroppedFiles([])
-            setSelectedFile(null)
-            setPreviewUrl(null)
         }
         setDisplayType('original')
-        setResults(null)
+        setResults([])
+        setSelectedResultIndices([])
     }, [])
 
     const handleAnalyze = async () => {
-        if (!selectedFile) return
+        if (droppedFiles.length === 0) return
 
         setLoading(true)
         setError(null)
+        setResults([])
 
-        const formData = new FormData()
-        formData.append('image', selectedFile)
-        formData.append('threshold', threshold)
-        formData.append('maxClusterAxis', maxClusterAxis)
-        formData.append('minSurface', minSurface)
-        formData.append('maxSurface', maxSurface)
-        formData.append('minRoundness', minRoundness)
-        formData.append('referenceThreshold', referenceThreshold)
-        formData.append('maxCost', maxCost)
-        formData.append('brightness', brightness)
-        formData.append('contrast', contrast)
-        formData.append('referenceMode', referenceMode)
-        formData.append('debug', debug)
-        formData.append('quick', quick)
+        const allResults = []
 
-        try {
-            const response = await axios.post('/api/analyze', formData)
-            setResults(response.data)
+        for (const file of droppedFiles) {
+            const formData = new FormData()
+            formData.append('image', file)
+            formData.append('threshold', parseFloat(threshold))
+            formData.append('maxClusterAxis', parseFloat(maxClusterAxis))
+            formData.append('minSurface', parseFloat(minSurface))
+            formData.append('maxSurface', parseFloat(maxSurface))
+            formData.append('minRoundness', parseFloat(minRoundness))
+            formData.append('referenceThreshold', parseFloat(referenceThreshold))
+            formData.append('maxCost', parseFloat(maxCost))
+            formData.append('brightness', parseFloat(brightness))
+            formData.append('contrast', parseFloat(contrast))
+            formData.append('referenceMode', referenceMode)
+            formData.append('debug', debug)
+            formData.append('quick', quick)
+
+            try {
+                const response = await axios.post('/api/analyze', formData)
+                allResults.push({
+                    filename: file.name,
+                    previewUrl: file.preview, // Use the preview URL already created by Dropzone
+                    ...response.data
+                })
+            } catch (err) {
+                console.error(`Error analyzing ${file.name}:`, err)
+                const errorMsg = err.response?.data?.message || err.response?.data?.error || err.message
+                setError(`Error analyzing ${file.name}: ${errorMsg}`)
+                break
+            }
+        }
+
+        if (allResults.length > 0) {
+            setResults(allResults)
+            setSelectedResultIndices([0])
             setDisplayType('thresholded')
-            const resultsCopy = {...response.data}
-            delete resultsCopy.thresholdImage
-            delete resultsCopy.outlinesImage
-            setTerseResults(resultsCopy)
-        } catch (err) {
-            console.error(err)
-            setError('Error during analysis. Please try again.')
-        } finally {
-            setLoading(false)
+            setViewMode('single')
         }
+        setLoading(false)
     }
 
-    const particles = results?.particles || []
-    // X-axis values depend on selected metric
-    const values = particles.map(p => histogramMetric === 'diameter' ? p.diameterMm : p.surfaceMm2)
-    let min = Math.min(...values)
-    let max = histogramMetric === 'diameter' ? (maxClusterAxis || Math.max(...values, 5)) : (maxClusterAxis || Math.max(...values, 5))
-
-    // Ensure min is positive for log scale
-    if (histogramScale === 'log' && min <= 0) {
-        min = 0.01
+    const getAggregatedParticles = (resultList) => {
+        return resultList.reduce((acc, res) => acc.concat(res.particles || []), [])
     }
 
-    const binCount = 20
-    let bins = []
+    const calculateBinData = (particles, stats, filename = 'Aggregate') => {
+        if (!particles || particles.length === 0) return null
 
-    if (histogramScale === 'log') {
-        const logMin = Math.log10(min)
-        const logMax = Math.log10(max)
-        const step = (logMax - logMin) / binCount
-        for (let i = 0; i <= binCount; i++) {
-            bins.push(Math.pow(10, logMin + i * step))
+        const values = particles.map(p => histogramMetric === 'diameter' ? p.diameterMm : p.surfaceMm2)
+        let minVal = Math.min(...values)
+        let maxVal = histogramMetric === 'diameter' ? (maxClusterAxis || Math.max(...values, 5)) : (maxClusterAxis || Math.max(...values, 5))
+
+        if (histogramScale === 'log' && minVal <= 0) {
+            minVal = 0.01
         }
-    } else {
-        const step = (max - min) / binCount
-        for (let i = 0; i <= binCount; i++) {
-            bins.push(min + i * step)
-        }
-    }
 
-    const binMasses = new Array(binCount).fill(0)
-    const binCounts = new Array(binCount).fill(0)
-    let totalMass = 0
+        const binCount = 20
+        let bins = []
 
-    particles.forEach(p => {
-        const v = histogramMetric === 'diameter' ? p.diameterMm : p.surfaceMm2
-        let binIdx
         if (histogramScale === 'log') {
-            if (v <= bins[0]) binIdx = 0
-            else if (v >= bins[binCount]) binIdx = binCount - 1
-            else {
-                // v = bins[0] * (bins[1]/bins[0])^idx
-                // log10(v) = log10(bins[0]) + idx * log10(bins[1]/bins[0])
-                // idx = (log10(v) - log10(bins[0])) / log10(bins[1]/bins[0])
-                binIdx = Math.floor((Math.log10(v) - Math.log10(bins[0])) / (Math.log10(bins[1]) - Math.log10(bins[0])))
-                binIdx = Math.min(Math.max(0, binIdx), binCount - 1)
+            const logMin = Math.log10(minVal)
+            const logMax = Math.log10(maxVal)
+            const step = (logMax - logMin) / binCount
+            for (let i = 0; i <= binCount; i++) {
+                bins.push(Math.pow(10, logMin + i * step))
             }
         } else {
-            if (v <= bins[0]) binIdx = 0
-            else if (v >= bins[binCount]) binIdx = binCount - 1
-            else {
-                binIdx = Math.floor((v - min) / (bins[1] - bins[0]))
-                binIdx = Math.min(Math.max(0, binIdx), binCount - 1)
+            const step = (maxVal - minVal) / binCount
+            for (let i = 0; i <= binCount; i++) {
+                bins.push(minVal + i * step)
             }
         }
-        if (binIdx >= 0 && binIdx < binCount) {
-            binMasses[binIdx] += p.volumeMm3 // mass is volume in mm^3
-            binCounts[binIdx]++
-            totalMass += p.volumeMm3
+
+        const binMasses = new Array(binCount).fill(0)
+        const binCounts = new Array(binCount).fill(0)
+        let totalMass = 0
+        let totalCount = 0
+
+        particles.forEach(p => {
+            const v = histogramMetric === 'diameter' ? p.diameterMm : p.surfaceMm2
+            let binIdx
+            if (histogramScale === 'log') {
+                if (v <= bins[0]) binIdx = 0
+                else if (v >= bins[binCount]) binIdx = binCount - 1
+                else {
+                    binIdx = Math.floor((Math.log10(v) - Math.log10(bins[0])) / (Math.log10(bins[1]) - Math.log10(bins[0])))
+                    binIdx = Math.min(Math.max(0, binIdx), binCount - 1)
+                }
+            } else {
+                if (v <= bins[0]) binIdx = 0
+                else if (v >= bins[binCount]) binIdx = binCount - 1
+                else {
+                    binIdx = Math.floor((v - minVal) / (bins[1] - bins[0]))
+                    binIdx = Math.min(Math.max(0, binIdx), binCount - 1)
+                }
+            }
+            if (binIdx >= 0 && binIdx < binCount) {
+                binMasses[binIdx] += p.volumeMm3
+                binCounts[binIdx]++
+                totalMass += p.volumeMm3
+                totalCount++
+            }
+        })
+
+        const binPercentages = binMasses.map(mass => totalMass > 0 ? (mass / totalMass) * 100 : 0)
+        const binCountPercentages = binCounts.map(count => totalCount > 0 ? (count / totalCount) * 100 : 0)
+
+        console.log(`Calculated bin data for ${filename}:`, {bins, binCounts, binPercentages, binCountPercentages, minVal, maxVal})
+        return {
+            id: filename,
+            bins,
+            binCounts,
+            binPercentages,
+            binCountPercentages,
+            histogramScale,
+            histogramMetric,
+            min: minVal,
+            max: maxVal,
+            statistics: stats,
+            yAxisMetric
         }
-    })
+    }
 
-    const binPercentages = binMasses.map(mass => (mass / totalMass) * 100)
+    let binDataList = []
+    let combinedStats = null
 
-    const binData = {
-        bins,
-        binCounts,
-        binPercentages,
-        histogramScale,
-        histogramMetric,
-        min,
-        max,
-        statistics: results?.statistics,
-        yAxisMetric,
-        setYAxisMetric
+    if (results.length > 0) {
+        if (viewMode === 'single' && selectedResultIndices.length > 0) {
+            const res = results[selectedResultIndices[0]]
+            if (res) {
+                binDataList = [calculateBinData(res.particles, res.statistics, res.filename)]
+            }
+        } else if (viewMode === 'comparison' && selectedResultIndices.length > 0) {
+            binDataList = selectedResultIndices.map(idx => {
+                const res = results[idx]
+                return res ? calculateBinData(res.particles, res.statistics, res.filename) : null
+            }).filter(Boolean)
+        } else if (viewMode === 'aggregate') {
+            const allParticles = getAggregatedParticles(results)
+            binDataList = [calculateBinData(allParticles, null, 'Aggregate')]
+        }
     }
 
     const maxImages = 5
@@ -221,7 +246,7 @@ function App() {
                                 size='small'
                             />
                             <Grid container spacing={1}>
-                                <Grid item xs={6}>
+                                <Grid xs={6}>
                                     <TextField
                                         label='Brightness'
                                         type='number'
@@ -233,7 +258,7 @@ function App() {
                                         inputProps={{step: 0.1}}
                                     />
                                 </Grid>
-                                <Grid item xs={6}>
+                                <Grid xs={6}>
                                     <TextField
                                         label='Contrast'
                                         type='number'
@@ -327,16 +352,16 @@ function App() {
                                 label='Debug Mode'
                             />
 
-                            <Button
-                                variant='contained'
-                                color='primary'
-                                fullWidth
-                                onClick={handleAnalyze}
-                                disabled={!selectedFile || loading}
-                                sx={{mt: 2}}
-                            >
-                                {loading ? <CircularProgress size={24}/> : 'Analyze'}
-                            </Button>
+                                    <Button
+                                        variant='contained'
+                                        color='primary'
+                                        fullWidth
+                                        onClick={handleAnalyze}
+                                        disabled={droppedFiles.length === 0 || loading}
+                                        sx={{mt: 2}}
+                                    >
+                                        {loading ? <CircularProgress size={24}/> : 'Analyze All'}
+                                    </Button>
                         </Paper>
                     </Grid>
 
@@ -344,83 +369,139 @@ function App() {
                     <Grid xs={12} md={8}>
                         {error && <Alert severity='error' sx={{mb: 2}}>{error}</Alert>}
 
-                        {previewUrl && (
-                            <Paper sx={{p: 2, textAlign: 'center', minHeight: 400}}>
-                                <Box>
-                                    <Box sx={{mb: 2}}>
-                                        <ToggleButtonGroup
-                                            value={displayType}
-                                            exclusive
-                                            onChange={(e, next) => next && setDisplayType(next)}
+                        {results.length > 0 && (
+                            <Paper sx={{p: 2, mb: 3}}>
+                                <Typography variant='h6' gutterBottom>Select Results to View</Typography>
+                                <Box sx={{display: 'flex', gap: 1, mb: 2, flexWrap: 'wrap'}}>
+                                    <Button
+                                        variant={viewMode === 'aggregate' ? 'contained' : 'outlined'}
+                                        onClick={() => {
+                                            setViewMode('aggregate')
+                                            setSelectedResultIndices([])
+                                        }}
+                                    >
+                                        Aggregate View
+                                    </Button>
+                                    {results.map((res, idx) => (
+                                        <Button
+                                            key={idx}
+                                            variant={selectedResultIndices.includes(idx) ? 'contained' : 'outlined'}
+                                            onClick={() => {
+                                                if (viewMode === 'comparison') {
+                                                    if (selectedResultIndices.includes(idx)) {
+                                                        setSelectedResultIndices(selectedResultIndices.filter(i => i !== idx))
+                                                    } else {
+                                                        if (selectedResultIndices.length < 2) {
+                                                            setSelectedResultIndices([...selectedResultIndices, idx])
+                                                        } else {
+                                                            setSelectedResultIndices([selectedResultIndices[1], idx])
+                                                        }
+                                                    }
+                                                } else {
+                                                    setViewMode('single')
+                                                    setSelectedResultIndices([idx])
+                                                }
+                                            }}
                                             size='small'
                                         >
-                                            <ToggleButton value='original'>Original</ToggleButton>
-                                            <ToggleButton value='thresholded'
-                                                          disabled={!results}>Thresholded</ToggleButton>
-                                            <ToggleButton value='outlines'
-                                                          disabled={!results}>Outlines</ToggleButton>
-                                        </ToggleButtonGroup>
-                                    </Box>
-
-                                    <Box>
-                                        {displayType === 'original' && <img src={previewUrl} alt='Original' style={{
-                                            maxWidth: '100%',
-                                            maxHeight: 600
-                                        }}/>}
-                                        {displayType === 'thresholded' && results?.thresholdImage &&
-                                            <img src={results.thresholdImage} alt='Thresholded'
-                                                 style={{maxWidth: '100%', maxHeight: 600}}/>}
-                                        {displayType === 'outlines' && results?.outlinesImage &&
-                                            <img src={results.outlinesImage} alt='Outlines'
-                                                 style={{maxWidth: '100%', maxHeight: 600}}/>}
-                                    </Box>
-                                    {results?.debug && (
-                                        <Box sx={{
-                                            mt: 2,
-                                            textAlign: 'left',
-                                            p: 1,
-                                            bgcolor: '#f5f5f5',
-                                            borderRadius: 1,
-                                            fontSize: '0.8rem'
-                                        }}>
-                                            <Typography variant='caption' display='block'><b>Debug
-                                                Info:</b></Typography>
-                                            <pre style={{
-                                                margin: 0,
-                                                overflow: 'auto'
-                                            }}>{JSON.stringify(results.debug, null, 2)}</pre>
-                                        </Box>
-                                    )}
+                                            {res.filename}
+                                        </Button>
+                                    ))}
                                 </Box>
+                                <FormControlLabel
+                                    control={
+                                        <Switch
+                                            checked={viewMode === 'comparison'}
+                                            onChange={(e) => {
+                                                setViewMode(e.target.checked ? 'comparison' : 'single')
+                                                if (e.target.checked) {
+                                                    if (selectedResultIndices.length > 2) {
+                                                        setSelectedResultIndices(selectedResultIndices.slice(0, 2))
+                                                    }
+                                                } else {
+                                                    setSelectedResultIndices(selectedResultIndices.length > 0 ? [selectedResultIndices[0]] : [])
+                                                }
+                                            }}
+                                        />
+                                    }
+                                    label='Comparison Mode (Select 2)'
+                                />
                             </Paper>
                         )}
 
-                        {results && (
+                        {viewMode === 'single' && selectedResultIndices.length > 0 && results[selectedResultIndices[0]] && (
+                            <Paper sx={{p: 2, textAlign: 'center', minHeight: 400}}>
+                                {(() => {
+                                    const res = results[selectedResultIndices[0]]
+                                    return (
+                                        <Box>
+                                            <Box sx={{mb: 2}}>
+                                                <ToggleButtonGroup
+                                                    value={displayType}
+                                                    exclusive
+                                                    onChange={(e, next) => next && setDisplayType(next)}
+                                                    size='small'
+                                                >
+                                                    <ToggleButton value='original'>Original</ToggleButton>
+                                                    <ToggleButton value='thresholded'>Thresholded</ToggleButton>
+                                                    <ToggleButton value='outlines'>Outlines</ToggleButton>
+                                                </ToggleButtonGroup>
+                                            </Box>
+
+                                            <Box>
+                                                {displayType === 'original' && res.previewUrl && <img src={res.previewUrl} alt='Original'
+                                                                                    style={{
+                                                                                        maxWidth: '100%',
+                                                                                        maxHeight: 600
+                                                                                    }}/>}
+                                                {displayType === 'thresholded' && res.thresholdImage &&
+                                                    <img src={res.thresholdImage} alt='Thresholded'
+                                                         style={{maxWidth: '100%', maxHeight: 600}}/>}
+                                                {displayType === 'outlines' && res.outlinesImage &&
+                                                    <img src={res.outlinesImage} alt='Outlines'
+                                                         style={{maxWidth: '100%', maxHeight: 600}}/>}
+                                            </Box>
+                                        </Box>
+                                    )
+                                })()}
+                            </Paper>
+                        )}
+
+                        {binDataList.length > 0 && (
                             <Box sx={{mt: 3, width: displayWidth}}>
-                                <Typography variant='h6' gutterBottom>Image Details</Typography>
-                                <TableContainer component={Paper} style={{marginBottom: 30}}>
-                                    <Table size='small'>
-                                        <TableBody>
-                                            {selectedFile?.name && (
-                                                <TableRow>
-                                                    <TableCell component='th' scope='row'>Filename</TableCell>
-                                                    <TableCell align='right'>{selectedFile.name}</TableCell>
-                                                </TableRow>
-                                            )}
-                                            <TableRow>
-                                                <TableCell component='th' scope='row'>Image Size</TableCell>
-                                                <TableCell align='right'>{results.width} x {results.height}</TableCell>
-                                            </TableRow>
-                                            {results.pixelScale && (
-                                                <TableRow>
-                                                    <TableCell component='th' scope='row'>Pixel Scale</TableCell>
-                                                    <TableCell
-                                                        align='right'>{results.pixelScale.toFixed(3)} pix/mm</TableCell>
-                                                </TableRow>
-                                            )}
-                                        </TableBody>
-                                    </Table>
-                                </TableContainer>
+                                {((viewMode === 'single' || viewMode === 'comparison') && selectedResultIndices.length > 0) && (
+                                    <>
+                                        <Typography variant='h6' gutterBottom>Image Details</Typography>
+                                        <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap', mb: 3 }}>
+                                            {selectedResultIndices.map(idx => {
+                                                const res = results[idx];
+                                                if (!res) return null;
+                                                return (
+                                                    <TableContainer key={idx} component={Paper} sx={{ flex: 1, minWidth: 300 }}>
+                                                        <Table size='small'>
+                                                            <TableBody>
+                                                                <TableRow>
+                                                                    <TableCell component='th' scope='row'>Filename</TableCell>
+                                                                    <TableCell align='right'>{res.filename}</TableCell>
+                                                                </TableRow>
+                                                                <TableRow>
+                                                                    <TableCell component='th' scope='row'>Image Size</TableCell>
+                                                                    <TableCell align='right'>{res.width} x {res.height}</TableCell>
+                                                                </TableRow>
+                                                                {res.pixelScale && (
+                                                                    <TableRow>
+                                                                        <TableCell component='th' scope='row'>Pixel Scale</TableCell>
+                                                                        <TableCell align='right'>{res.pixelScale.toFixed(3)} pix/mm</TableCell>
+                                                                    </TableRow>
+                                                                )}
+                                                            </TableBody>
+                                                        </Table>
+                                                    </TableContainer>
+                                                );
+                                            })}
+                                        </Box>
+                                    </>
+                                )}
 
                                 <Box sx={{
                                     display: 'flex',
@@ -430,7 +511,9 @@ function App() {
                                     flexWrap: 'wrap',
                                     gap: 1
                                 }}>
-                                    <Typography variant='h6' gutterBottom>Particle Analysis Results</Typography>
+                                    <Typography variant='h6' gutterBottom>
+                                        {viewMode === 'aggregate' ? 'Aggregated Results' : (viewMode === 'comparison' ? 'Comparison Results' : 'Particle Analysis Results')}
+                                    </Typography>
                                     <ToggleButtonGroup
                                         value={histogramMetric}
                                         exclusive
@@ -441,76 +524,83 @@ function App() {
                                         <ToggleButton value='surface'>Surface</ToggleButton>
                                     </ToggleButtonGroup>
                                 </Box>
-                                <TableContainer component={Paper}>
-                                    <Table size='small'>
-                                        <TableBody>
-                                            <TableRow>
-                                                <TableCell component='th' scope='row'>Particle Count</TableCell>
-                                                <TableCell align='right'>{results.particleCount}</TableCell>
-                                            </TableRow>
-                                            {results.statistics && (
-                                                (() => {
-                                                    const statSource = histogramMetric === 'diameter' ? (results.statistics.diameter || results.statistics) : results.statistics.surface
-                                                    const unit = histogramMetric === 'diameter' ? 'mm' : 'mm²'
-                                                    const prefix = histogramMetric === 'diameter' ? 'D' : 'S'
 
-                                                    if (!statSource) return null
+                                {(viewMode === 'single' || viewMode === 'comparison') && selectedResultIndices.length > 0 && (
+                                    <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
+                                        {selectedResultIndices.map(idx => {
+                                            const res = results[idx];
+                                            if (!res) return null;
+                                            return (
+                                                <TableContainer key={idx} component={Paper} sx={{ flex: 1, minWidth: 300 }}>
+                                                    <Table size='small'>
+                                                        <TableBody>
+                                                            <TableRow>
+                                                                <TableCell component='th' scope='row' sx={{ fontWeight: 'bold' }}>{res.filename}</TableCell>
+                                                                <TableCell align='right'></TableCell>
+                                                            </TableRow>
+                                                            <TableRow>
+                                                                <TableCell component='th' scope='row'>Particle Count</TableCell>
+                                                                <TableCell align='right'>{res.particleCount}</TableCell>
+                                                            </TableRow>
+                                                            {res.statistics && (
+                                                                (() => {
+                                                                    const statSource = histogramMetric === 'diameter' ? (res.statistics.diameter || res.statistics) : res.statistics.surface
+                                                                    const unit = histogramMetric === 'diameter' ? 'mm' : 'mm²'
+                                                                    const prefix = histogramMetric === 'diameter' ? 'D' : 'S'
 
-                                                    return (
-                                                        <>
-                                                            <TableRow>
-                                                                <TableCell component='th'
-                                                                           scope='row'>{prefix}10</TableCell>
-                                                                <TableCell
-                                                                    align='right'>{statSource.p10?.toFixed(3) || statSource.D10?.toFixed(3)} {unit}</TableCell>
-                                                            </TableRow>
-                                                            <TableRow>
-                                                                <TableCell component='th' scope='row'>{prefix}50
-                                                                    (Median)</TableCell>
-                                                                <TableCell
-                                                                    align='right'>{statSource.p50?.toFixed(3) || statSource.D50?.toFixed(3)} {unit}</TableCell>
-                                                            </TableRow>
-                                                            <TableRow>
-                                                                <TableCell component='th'
-                                                                           scope='row'>{prefix}90</TableCell>
-                                                                <TableCell
-                                                                    align='right'>{statSource.p90?.toFixed(3) || statSource.D90?.toFixed(3)} {unit}</TableCell>
-                                                            </TableRow>
-                                                            <TableRow>
-                                                                <TableCell component='th' scope='row'>Mode</TableCell>
-                                                                <TableCell
-                                                                    align='right'>{statSource.mode.toFixed(3)} {unit}</TableCell>
-                                                            </TableRow>
-                                                            <TableRow>
-                                                                <TableCell component='th' scope='row'>Std.
-                                                                    Dev.</TableCell>
-                                                                <TableCell
-                                                                    align='right'>{statSource.stdDev.toFixed(3)} {unit}</TableCell>
-                                                            </TableRow>
-                                                            <TableRow>
-                                                                <TableCell component='th' scope='row'>Mean</TableCell>
-                                                                <TableCell
-                                                                    align='right'>{statSource.mean.toFixed(3)} {unit}</TableCell>
-                                                            </TableRow>
-                                                        </>
-                                                    )
-                                                })()
-                                            )}
-                                        </TableBody>
-                                    </Table>
-                                </TableContainer>
+                                                                    if (!statSource) return null
 
-                                {results.pixelScale && results.particles.length > 0 && (
-                                    <Histogram binData={binData} histogramScale={histogramScale}
-                                               setHistogramScale={setHistogramScale} histogramMetric={histogramMetric}
-                                               setHistogramMetric={setHistogramMetric}/>
+                                                                    return (
+                                                                        <>
+                                                                            <TableRow>
+                                                                                <TableCell component='th' scope='row'>{prefix}10</TableCell>
+                                                                                <TableCell align='right'>{statSource.p10?.toFixed(3) || statSource.D10?.toFixed(3)} {unit}</TableCell>
+                                                                            </TableRow>
+                                                                            <TableRow>
+                                                                                <TableCell component='th' scope='row'>{prefix}50 (Median)</TableCell>
+                                                                                <TableCell align='right'>{statSource.p50?.toFixed(3) || statSource.D50?.toFixed(3)} {unit}</TableCell>
+                                                                            </TableRow>
+                                                                            <TableRow>
+                                                                                <TableCell component='th' scope='row'>{prefix}90</TableCell>
+                                                                                <TableCell align='right'>{statSource.p90?.toFixed(3) || statSource.D90?.toFixed(3)} {unit}</TableCell>
+                                                                            </TableRow>
+                                                                            <TableRow>
+                                                                                <TableCell component='th' scope='row'>Mode</TableCell>
+                                                                                <TableCell align='right'>{statSource.mode.toFixed(3)} {unit}</TableCell>
+                                                                            </TableRow>
+                                                                            <TableRow>
+                                                                                <TableCell component='th' scope='row'>Std. Dev.</TableCell>
+                                                                                <TableCell align='right'>{statSource.stdDev.toFixed(3)} {unit}</TableCell>
+                                                                            </TableRow>
+                                                                            <TableRow>
+                                                                                <TableCell component='th' scope='row'>Mean</TableCell>
+                                                                                <TableCell align='right'>{statSource.mean.toFixed(3)} {unit}</TableCell>
+                                                                            </TableRow>
+                                                                        </>
+                                                                    )
+                                                                })()
+                                                            )}
+                                                        </TableBody>
+                                                    </Table>
+                                                </TableContainer>
+                                            );
+                                        })}
+                                    </Box>
                                 )}
+
+                                <HistogramSelect
+                                    binDataList={binDataList}
+                                    histogramScale={histogramScale}
+                                    setHistogramScale={setHistogramScale}
+                                    yAxisMetric={yAxisMetric}
+                                    setYAxisMetric={setYAxisMetric}
+                                />
                             </Box>
                         )}
                     </Grid>
                 </Grid>
             </Container>
-            {results && (
+            {results.length > 0 && viewMode === 'single' && selectedResultIndices.length > 0 && (
                 <Box sx={{
                     display: 'flex',
                     justifyContent: 'center',
@@ -520,8 +610,13 @@ function App() {
                     gap: 1,
                     maxWidth: '650px'
                 }}>
-                    <ExportButton text='Export' filename={selectedFile?.name} particles={results?.particles}
-                                  binData={binData} statistics={results?.statistics}/>
+                    <ExportButton
+                        text='Export'
+                        filename={results[selectedResultIndices[0]].filename}
+                        particles={results[selectedResultIndices[0]].particles}
+                        binData={binDataList[0]}
+                        statistics={results[selectedResultIndices[0]].statistics}
+                    />
                 </Box>
             )}
         </Box>
